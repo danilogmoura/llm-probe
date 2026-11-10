@@ -1,0 +1,12 @@
+# ambiente virtual local (nao vai para o build context)
+.venv/
+venv/
+env/
+
+__pycache__/
+*.pyc
+*.pyo
+
+# artefatos de build/export em qualquer nivel (ex.: llm-bridge.tar)
+*.tar
+**/*.tar
