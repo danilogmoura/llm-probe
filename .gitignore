@@ -1,0 +1,25 @@
+# Material da atividade / docs institucionais (não versionar)
+Guia da plataforma _ Devel LLM Portal.pdf
+manual.md
+
+# Artefatos de build/imagem Docker (sempre regeneráveis)
+# cobre ./ e qualquer subpasta (ex.: probe-llm/probe-llm.tar)
+*.tar
+**/*.tar
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Ambiente / credenciais
+.env
+.env.*
+
+# SO / editor
+.DS_Store
+Thumbs.db
+*.swp

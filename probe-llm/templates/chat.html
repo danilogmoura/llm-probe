@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="pt-br">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>probe-llm - perguntar ao modelo</title>
+    <style>
+        body {
+            font-family: system-ui, Arial, sans-serif;
+            max-width: 760px;
+            margin: 2rem auto;
+            padding: 0 1rem;
+            color: #1c1c28
+        }
+
+        h1 {
+            font-size: 1.3rem
+        }
+
+        .sub {
+            color: #666;
+            font-size: .9rem;
+            margin-bottom: 1.2rem
+        }
+
+        textarea {
+            width: 100%;
+            box-sizing: border-box;
+            font: inherit;
+            padding: .6rem;
+            border: 1px solid #bbb;
+            border-radius: 8px;
+            min-height: 90px
+        }
+
+        .row {
+            display: flex;
+            gap: .6rem;
+            align-items: center;
+            margin: .8rem 0;
+            flex-wrap: wrap
+        }
+
+        button {
+            font: inherit;
+            padding: .55rem 1.1rem;
+            border: 0;
+            border-radius: 8px;
+            background: #2a2a4a;
+            color: #fff;
+            cursor: pointer
+        }
+
+        button:disabled {
+            opacity: .5;
+            cursor: default
+        }
+
+        label {
+            font-size: .9rem;
+            display: flex;
+            gap: .35rem;
+            align-items: center
+        }
+
+        pre {
+            white-space: pre-wrap;
+            word-break: break-word;
+            background: #f4f4f8;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: .8rem;
+            min-height: 2rem
+        }
+
+        details {
+            margin-top: .6rem
+        }
+
+        summary {
+            cursor: pointer;
+            color: #555;
+            font-size: .85rem
+        }
+
+        .meta {
+            color: #777;
+            font-size: .8rem;
+            margin-top: .4rem
+        }
+
+        .err {
+            color: #b00020
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Perguntar ao modelo</h1>
+    <div class="sub">Modelo: <code>{{ model }}</code> &middot; Endpoint: <code>{{ url }}</code></div>
+    <textarea id="q" placeholder="Escreva sua pergunta aqui..."></textarea>
+    <div class="row">
+        <button id="go">Perguntar</button>
+        <label><input type="checkbox" id="think"> pensar antes (thinking)</label>
+        <span class="meta" id="status"></span>
+    </div>
+    <pre id="a">A resposta aparece aqui.</pre>
+    <details id="thWrap" style="display:none">
+        <summary>raciocinio do modelo (thinking)</summary>
+        <pre id="th"></pre>
+    </details>
+    <script>
+        const $ = id => document.getElementById(id);
+        async function ask() {
+            const q = $('q').value.trim(); if (!q) { $('status').textContent = 'Digite uma pergunta.'; return; }
+            $('go').disabled = true; $('status').textContent = 'Pensando...'; $('a').textContent = ''; $('thWrap').style.display = 'none';
+            const t0 = Date.now();
+            try {
+                const r = await fetch('/api/ask', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ prompt: q, think: $('think').checked })
+                });
+                const d = await r.json();
+                const secs = ((Date.now() - t0) / 1000).toFixed(1);
+                if (d.ok) {
+                    $('a').textContent = d.response || '(resposta vazia)';
+                    if (d.thinking) { $('th').textContent = d.thinking; $('thWrap').style.display = 'block'; }
+                    $('status').textContent = 'OK em ' + secs + 's' + (d.ms ? (' (' + d.ms + 'ms no servidor)') : '');
+                } else {
+                    $('a').innerHTML = '<span class="err">Falhou: ' + (d.error || d.reason || ('HTTP ' + (d.status || '?'))) + '</span>';
+                    if (d.error_body) $('th').textContent = d.error_body, $('thWrap').style.display = 'block';
+                    $('status').textContent = 'erro';
+                }
+            } catch (e) { $('a').innerHTML = '<span class="err">Erro de rede: ' + e + '</span>'; $('status').textContent = 'erro'; }
+            finally { $('go').disabled = false; }
+        }
+        $('go').onclick = ask;
+        $('q').addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') ask(); });
+    </script>
+</body>
+
+</html>
