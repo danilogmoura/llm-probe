@@ -42,7 +42,8 @@ PROBE_BUDGET=55
 | --- | --- | --- |
 | `LLM_URL` | *(sem default)* | Endpoint da LLM interna. Obrigatório para qualquer chamada real. |
 | `LLM_MODEL` | *(sem default)* | Nome do modelo escolhido. Sem ele, o chat avisa que falta configuração. |
-| `LLM_TIMEOUT` | `120` | Timeout (s) de cada chamada de rede individual (`/dns`, `/tcp`, …). Alto porque o modelo thinking gera raciocínio longo antes de responder. |
+| `LLM_TIMEOUT` | `120` | Timeout (s) de **leitura** (espera pela resposta da LLM). Alto porque o modelo thinking gera raciocínio longo antes de responder. |
+| `CONNECT_TIMEOUT` | `10` | Timeout (s) de **conectividade** (abrir TCP/TLS). Host morto ou porta fechada falha rápido em todas as rotas, sem esperar o `LLM_TIMEOUT` inteiro. |
 | `PROBE_BUDGET` | `55` | Teto (s) da cascata completa do `/probe`. |
 | `CHAT_BUDGET` | `150` | Teto (s) de cada pergunta na página `/chat` (rota `/api/ask`). |
 | `PORT` | `8080` | Porta de escuta (usada no fallback `python app.py`; o gunicorn fixa 8080). |
