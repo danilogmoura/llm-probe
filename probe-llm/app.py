@@ -35,16 +35,21 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "")
 # (nao 30). Override por env se quiser mais/menos.
 LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "120"))
 
+# Timeout efetivo do worker gunicorn (--timeout no CMD do Dockerfile). Esta
+# constante e a FONTE UNICA desse numero para diagnosticos: mantenha-a igual ao
+# valor passado em --timeout no Dockerfile. Se mudar la, mude aqui.
+GUNICORN_TIMEOUT = float(os.environ.get("GUNICORN_TIMEOUT", "180"))
+
 # Orcamento de tempo do /probe (segundos). O gunicorn mata o worker quando uma
-# requisicao ultrapassa --timeout (Dockerfile: 60s). Como cada chamada LLM pode
+# requisicao ultrapassa --timeout (GUNICORN_TIMEOUT). Como cada chamada LLM pode
 # levar ate LLM_TIMEOUT, o /probe roda em cascata apenas ate este budget e
 # retorna o que completou, marcando o resto como 'skipped'. Mantenha ABAIXO do
 # --timeout do gunicorn.
 PROBE_BUDGET = float(os.environ.get("PROBE_BUDGET", "55"))
 
 # Teto da pagina /chat: cada pergunta deve responder antes do --timeout do
-# Gunicorn (180s). Um modelo thinking gera raciocinio longo, entao uma resposta
-# real pode passar de 120s; 150s fica abaixo do timeout do worker.
+# Gunicorn (GUNICORN_TIMEOUT). Um modelo thinking gera raciocinio longo, entao
+# uma resposta real pode passar de 120s; 150s fica abaixo do timeout do worker.
 CHAT_BUDGET = float(os.environ.get("CHAT_BUDGET", "150"))
 
 _parsed = urlparse(LLM_URL)
@@ -266,7 +271,7 @@ def step_env():
         "llm_timeout_s": LLM_TIMEOUT,
         "probe_budget_s": PROBE_BUDGET,
         "chat_budget_s": CHAT_BUDGET,
-        "gunicorn_timeout_s": 60,
+        "gunicorn_timeout_s": GUNICORN_TIMEOUT,
         "constraint": "todos os budgets devem ficar ABAIXO do gunicorn --timeout",
         "vars": {k: present(k) for k in keys},
         "count_total_env": len(os.environ),
@@ -356,16 +361,11 @@ def probe_all():
     """Cascata de CONECTIVIDADE com orcamento de tempo (PROBE_BUDGET).
 
     Roda dns -> tcp -> tls -> model (api/show) em ordem, parando na primeira falha,
-    para responder 'a rede ate o LLM esta OK?'. NAO executa geracao: modelos thinking
-    podem levar minutos; a geracao vive em /llm/generate-stream (SSE). Por isso o
-    passo 'generate' sai marcado como deferred.
-
-    Define um deadline global (_PROBE_DEADLINE) e roda as etapas em ordem. Toda
-    etapa de rede (tcp/tls/http/generate/chat) encurta seu timeout ao restante do
-    budget via _net_timeout(), entao nenhuma chamada pendurada consegue estourar
-    o --timeout do gunicorn (WORKER TIMEOUT). Antes de cada etapa, se o budget
-    acabou, marca as restantes como 'skipped'. As rotas individuais continuam
-    usando LLM_TIMEOUT cheio (deadline desligado fora desta rota)."""
+    para responder 'a rede ate o LLM esta OK?'. Cada etapa encurta seu timeout ao
+    restante do budget via _net_timeout(); quando o budget acaba, as etapas
+    restantes saem 'skipped'. NAO executa geracao (modelos thinking podem levar
+    minutos): o passo 'generate' sai 'deferred' e a geracao vive em
+    /llm/generate-stream."""
     global _PROBE_DEADLINE
     t_start = time.time()
     out = {}
@@ -390,9 +390,7 @@ def probe_all():
             run("tcp", step_tcp)
             run("tls", step_tls)
             run("model", step_model)
-            # NAO roda generate sincrono na cascata: modelos thinking
-            # podem levar minutos e estourariam o budget/worker. A geracao longa
-            # fica nas rotas dedicadas (/llm/generate-stream com SSE).
+            # Geracao fica fora da cascata (ver docstring); so marca deferred.
             out["generate"] = {
                 "ok": None,
                 "deferred": True,
@@ -440,8 +438,8 @@ def probe_generate():
 
 @app.get("/llm/generate-stream")
 def probe_generate_stream():
-    """Gera em streaming (SSE) para suportar modelos thinking longos sem
-    estourar o worker. Uso: /llm/generate-stream?prompt=...&think=on|off"""
+    """Rota SSE de geracao; rationale do streaming em step_generate_stream.
+    Uso: /llm/generate-stream?prompt=...&think=on|off"""
     prompt = os.environ.get("PROBE_PROMPT", "Qual e 2+2? Responda so o numero.")
     prompt = req.args.get("prompt", prompt)
     think = _parse_think(req.args.get("think"))
