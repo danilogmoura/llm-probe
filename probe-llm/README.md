@@ -76,8 +76,8 @@ PROBE_BUDGET=55
 
 ## Rotas
 
-O app expõe **14 rotas**: as de uso normal (chat + streaming), as de diagnóstico/aquecimento
-e as de performance (`/bench`, `/sweep`).
+O app expõe **16 rotas**: as de uso normal (chat + streaming), as de diagnóstico/aquecimento,
+as de performance (`/bench`, `/sweep`) e as de recursos do container (`/system/stats`, `/perf`).
 A conectividade com a LLM interna é testada pela cascata `/probe` (DNS → TCP → TLS →
 modelo → versão), que roda todas as etapas em ordem num único JSON, sem nunca derrubar o servidor.
 
@@ -178,6 +178,30 @@ calcula throughput — nada é estimado no cliente, exceto o TTFT.
 O evento `done` do SSE de `/llm/generate-stream` agora inclui `ttft_ms` e `stats` (as mesmas
 métricas nativas), e a resposta de `/api/ask` traz `stats` enriquecido — dá para acompanhar
 throughput sem sair do chat.
+
+### Recursos do container (`/system/stats`, `/perf`)
+
+O probe roda como container isolado (Azure App Service): **não** há socket Docker montado
+nem como rodar `docker stats` contra si mesmo. A alternativa é a **autopsia** — ler os
+arquivos internos do próprio container.
+
+- `GET /system/stats` → JSON com a autopsia do container:
+  - **Memória/CPU do container** via **cgroup** (v2 em `/sys/fs/cgroup/*`, com *fallback* v1
+    em `memory/`, `cpu/`): uso, limite, % do limite, cache, segundos de CPU acumulados e
+    núcleos (quota e visíveis).
+  - **Processo**: PID, RSS e tempo de CPU do worker gunicorn (`/proc/self`).
+  - **Host** (referência compartilhada, não isolada): RAM total/disponível (`/proc/meminfo`),
+    load average, uptime e nº de CPUs.
+  - **Rede**: bytes recebidos/enviados agregados das interfaces (`/proc/net/dev`).
+  Tudo é *best-effort*: arquivo ausente ou ilegível vira `null`, nunca exceção. Não expõe
+  hostname, IP interno, ambiente nem credenciais.
+- `GET /perf` → **página HTML** que reúne tudo numa tela: painel de recursos que se
+  auto-atualiza (5 s), estado do modelo na memória (`/api/ps`) e um formulário que roda o
+  `/bench` ao vivo no navegador e pinta a tabela de p50/p95.
+
+> **GPU/VRAM não são obtíveis pela API.** O Ollama institucional não expõe o endpoint
+> Prometheus `/metrics` (retorna 404), então uso de GPU em % não está acessível. Use
+> `load_ms` do `/bench` como proxy do custo de carga do modelo.
 
 ## Ordem recomendada para as checagens
 

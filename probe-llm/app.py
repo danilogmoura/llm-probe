@@ -491,6 +491,257 @@ def _parse_int_list(raw, default=None):
     return out or list(default or [])
 
 
+# --------------------------------------------------------------------------
+# Autopsia do PROPRIO container (cgroup + /proc). Le arquivos do filesystem;
+# NAO usa socket Docker nem comandos externos, entao funciona dentro do App
+# Service. Tudo best-effort: arquivo ausente/ilegivel vira None, nunca excecao.
+# Suporta cgroup v2 (arquivos em /sys/fs/cgroup/<nome>) e v1 (subpasta memory/,
+# cpu/). Valores brutos sao convertidos para unidades legiveis no final.
+# --------------------------------------------------------------------------
+_CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+def _read_first(lines):
+    """Primeira linha de um texto ja lido, sem \\n; None se vazio."""
+    if not lines:
+        return None
+    first = lines.split("\n", 1)[0].strip()
+    return first or None
+
+
+def _read_cgroup_file(rel_v2, rel_v1=None):
+    """Le um arquivo de cgroup tentando v2 primeiro e depois v1.
+
+    'rel_v2' e o caminho relativo a raiz (ex.: 'memory.current'); 'rel_v1' o
+    equivalente v1 (ex.: 'memory/memory.usage_in_bytes'). Retorna o conteudo
+    como string ou None se nenhum existir/for legivel."""
+    candidates = [os.path.join(_CGROUP_ROOT, rel_v2)]
+    if rel_v1:
+        candidates.append(os.path.join(_CGROUP_ROOT, rel_v1))
+    for path in candidates:
+        try:
+            with open(path, "r") as fh:
+                return fh.read()
+        except OSError:
+            continue
+    return None
+
+
+def _cgroup_is_v2():
+    """Detecta unified hierarchy: em v2 /proc/self/cgroup comeca com '0::/' e
+    existe memory.current na raiz. Em v1 ha subpastas por controlador."""
+    try:
+        with open("/proc/self/cgroup", "r") as fh:
+            txt = fh.read()
+    except OSError:
+        txt = ""
+    if "0::/" in txt and os.path.exists(os.path.join(_CGROUP_ROOT, "memory.current")):
+        return True
+    return False
+
+
+def _parse_mem_bytes(raw):
+    """Converte conteudo de memory.current/limit em bytes int. 'max'/vazio -> None."""
+    line = _read_first(raw)
+    if line is None or line == "max":
+        return None
+    try:
+        val = int(line)
+    except ValueError:
+        return None
+    # Limite 'sem limite' costuma vir como numero gigante (~2^63); tratar como None.
+    if val >= (1 << 62):
+        return None
+    return val
+
+
+def _container_memory():
+    """Uso e limite de RAM do CONTAINER via cgroup (nao do host).
+
+    Retorna dict com used_bytes, limit_bytes, pct e human. Em cgroup v2 le
+    memory.current/memory.max (+ stat p/ detalhes); em v1, usage/limit_in_bytes.
+    Sem limite definido, limit fica None e pct tambem."""
+    if _cgroup_is_v2():
+        cur = _parse_mem_bytes(_read_cgroup_file("memory.current"))
+        lim = _parse_mem_bytes(_read_cgroup_file("memory.max"))
+        stat_raw = _read_cgroup_file("memory.stat") or ""
+    else:
+        cur = _parse_mem_bytes(
+            _read_cgroup_file("memory.current", "memory/memory.usage_in_bytes"))
+        lim = _parse_mem_bytes(
+            _read_cgroup_file("memory.max", "memory/memory.limit_in_bytes"))
+        stat_raw = _read_cgroup_file("memory.stat", "memory/memory.stat") or ""
+    cache = None
+    for token in ("file ", "cache "):  # v2 usa 'file'; v1 usa 'cache'
+        for ln in stat_raw.splitlines():
+            if ln.startswith(token):
+                try:
+                    cache = int(ln.split()[1])
+                except (ValueError, IndexError):
+                    pass
+                break
+        if cache is not None:
+            break
+    pct = round(cur / lim * 100, 1) if cur is not None and lim else None
+    return {"used_bytes": cur, "limit_bytes": lim, "cache_bytes": cache,
+            "pct_of_limit": pct, "used_human": _human_bytes(cur),
+            "limit_human": _human_bytes(lim)}
+
+
+def _container_cpu():
+    """Tempo de CPU consumido pelo container (cgroup) e nucleos disponiveis.
+
+    cgroup v2: cpu.stat traz usage_usec/total; cpu.max traz 'quota period'.
+    v1: cpuacct.usage (ns) e cfs_quota_us/cfs_period_us. Retorna uso acumulado
+    em segundos, nucleos efetivos (quota/period) e nucleos visiveis no host."""
+    usage_sec = None
+    cores_quota = None
+    if _cgroup_is_v2():
+        stat_raw = _read_cgroup_file("cpu.stat") or ""
+        for ln in stat_raw.splitlines():
+            if ln.startswith("usage_usec"):
+                try:
+                    usage_sec = int(ln.split()[1]) / 1_000_000.0
+                except (ValueError, IndexError):
+                    pass
+        max_raw = _read_cgroup_file("cpu.max")
+        line = _read_first(max_raw) if max_raw else None
+        if line:
+            parts = line.split()
+            if len(parts) == 2 and parts[0] != "max":
+                try:
+                    cores_quota = round(int(parts[0]) / int(parts[1]), 2)
+                except (ValueError, ZeroDivisionError):
+                    pass
+    else:
+        raw = _read_cgroup_file("cpu.max", "cpuacct/cpuacct.usage")
+        line = _read_first(raw) if raw else None
+        if line:
+            try:
+                usage_sec = int(line) / 1_000_000_000.0
+            except ValueError:
+                pass
+        quota = _read_first(_read_cgroup_file("cpu.max", "cpu/cpu.cfs_quota_us"))
+        period = _read_first(_read_cgroup_file("cpu.max", "cpu/cpu.cfs_period_us"))
+        try:
+            if quota and period and int(quota) > 0:
+                cores_quota = round(int(quota) / int(period), 2)
+        except ValueError:
+            pass
+    return {"cpu_seconds_total": round(usage_sec, 2) if usage_sec is not None else None,
+            "cores_quota": cores_quota, "cores_visible": os.cpu_count()}
+
+
+def _host_memory():
+    """RAM total/livre do HOST vista de /proc/meminfo (referencia; em containers
+    compartilhada). None se nao conseguir ler."""
+    total_kb = avail_kb = None
+    try:
+        with open("/proc/meminfo") as fh:
+            for ln in fh:
+                if ln.startswith("MemTotal:"):
+                    total_kb = int(ln.split()[1])
+                elif ln.startswith("MemAvailable:"):
+                    avail_kb = int(ln.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    to_b = lambda kb: kb * 1024 if kb is not None else None
+    return {"total_bytes": to_b(total_kb), "available_bytes": to_b(avail_kb),
+            "total_human": _human_bytes(to_b(total_kb)),
+            "available_human": _human_bytes(to_b(avail_kb))}
+
+
+def _loadavg():
+    """1/5/15 min via os.getloadavg(); None se indisponivel."""
+    try:
+        la = os.getloadavg()
+        return {"load_1": round(la[0], 2), "load_5": round(la[1], 2),
+                "load_15": round(la[2], 2)}
+    except OSError:
+        return {"load_1": None, "load_5": None, "load_15": None}
+
+
+def _net_dev_bytes():
+    """Soma recebidos/enviados de todas as interfaces exceto loopback, lendo
+    /proc/net/dev. Retorna dict rx_bytes/tx_bytes + human. Best-effort."""
+    rx = tx = 0
+    got = False
+    try:
+        with open("/proc/net/dev") as fh:
+            for ln in fh:
+                if ":" not in ln:
+                    continue
+                iface, rest = ln.split(":", 1)
+                if iface.strip() == "lo":
+                    continue
+                cols = rest.split()
+                if len(cols) >= 9:
+                    rx += int(cols[0])
+                    tx += int(cols[8])
+                    got = True
+    except (OSError, ValueError, IndexError):
+        pass
+    if not got:
+        return {"rx_bytes": None, "tx_bytes": None,
+                "rx_human": None, "tx_human": None}
+    return {"rx_bytes": rx, "tx_bytes": tx,
+            "rx_human": _human_bytes(rx), "tx_human": _human_bytes(tx)}
+
+
+def _uptime_s():
+    """Segundos desde o boot do host (/proc/uptime)."""
+    try:
+        with open("/proc/uptime") as fh:
+            return round(float(fh.read().split()[0]))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _process_info():
+    """Dados do processo da app: PID, RSS (residente) lendo /proc/self/status, e
+    tempo de CPU do processo via /proc/self/stat (utime+stime em jiffies->s)."""
+    rss_kb = None
+    try:
+        with open("/proc/self/status") as fh:
+            for ln in fh:
+                if ln.startswith("VmRSS:"):
+                    rss_kb = int(ln.split()[1])
+                    break
+    except (OSError, ValueError, IndexError):
+        pass
+    proc_cpu_s = None
+    hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    try:
+        with open("/proc/self/stat") as fh:
+            fields = fh.read().rsplit(")", 1)[-1].split()
+            utime = int(fields[11]); stime = int(fields[12])
+            proc_cpu_s = round((utime + stime) / hz, 2)
+    except (OSError, ValueError, IndexError):
+        pass
+    return {"pid": os.getpid(), "rss_bytes": rss_kb * 1024 if rss_kb else None,
+            "rss_human": _human_bytes(rss_kb * 1024 if rss_kb else None),
+            "cpu_seconds": proc_cpu_s}
+
+
+def system_stats():
+    """Monta o retrato de recursos do container: memoria/CPU proprios (cgroup),
+    referencia do host, rede, uptime e processo. So leitura de arquivos - nada de
+    socket Docker, nada de comando externo, nada sensivel exposto."""
+    return {
+        "ok": True,
+        "app": APP_NAME,
+        "cgroup_version": 2 if _cgroup_is_v2() else 1,
+        "container": {"memory": _container_memory(), "cpu": _container_cpu()},
+        "process": _process_info(),
+        "host": {"memory": _host_memory(), "loadavg": _loadavg(),
+                 "uptime_s": _uptime_s(), "cpus": os.cpu_count()},
+        "network": _net_dev_bytes(),
+        "note": ("memoria/cpu do container vem de cgroup; host eh apenas "
+                 "referencia compartilhada. Sem GPU/VRAM: a API do Ollama nao "
+                 "expoe isso e /metrics (Prometheus) retorna 404."),
+    }
+
+
 def _openai_headers():
     """Headers p/ os endpoints OpenAI-compat do Ollama.
 
@@ -1216,6 +1467,23 @@ def sweep():
                  "os pontos; keep_alive=0 descarrega apos cada chamada, -1 fixa."),
     })
 
+
+
+@app.get("/system/stats")
+def system_stats_route():
+    """Retrato de recursos do PROPRIO container (memoria/CPU via cgroup, rede,
+    uptime, processo). Le apenas arquivos internos - sem socket Docker e sem
+    comando externo. Nao expoe hostname/IP/credencial."""
+    return jsonify(system_stats())
+
+
+@app.get("/perf")
+def perf_page():
+    """Pagina HTML que agrega: autopsia do container (/system/stats), estado do
+    modelo na memoria (/api/ps via /llm/version) e throughput sob demanda
+    (/bench). O formulario roda /bench via fetch e pinta a tabela no navegador."""
+    model = LLM_MODEL or "(LLM_MODEL nao definido)"
+    return render_template("perf.html", model=model, url=LLM_URL)
 
 
 @app.get("/env")

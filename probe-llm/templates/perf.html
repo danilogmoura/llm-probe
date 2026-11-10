@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="pt-br">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>probe-llm - monitor</title>
+    <link rel="stylesheet" href="/static/perf.css">
+</head>
+
+<body>
+    <h1>&#9635; probe-llm &middot; monitor</h1>
+    <div class="sub">modelo: <b>{{ model }}</b> &middot; endpoint: <code>{{ url or "(LLM_URL nao definido)" }}</code>
+        &middot; <a href="/">rotas</a> &middot; <a href="/chat">chat</a></div>
+
+    <h2>Recursos do container</h2>
+    <div class="grid">
+        <div class="panel">
+            <div class="dim">MEM&Oacute;RIA (cgroup)</div>
+            <div class="bar" id="memBar"><i></i><b id="memPct"></b></div>
+            <dl class="kv">
+                <dt>usada</dt>
+                <dd id="memUsed">&mdash;</dd>
+                <dt>cache</dt>
+                <dd id="memCache">&mdash;</dd>
+                <dt>limite</dt>
+                <dd id="memLimit">&mdash;</dd>
+            </dl>
+        </div>
+        <div class="panel">
+            <div class="dim">CPU</div>
+            <canvas class="spark" id="cpuSpark" width="280" height="46"></canvas>
+            <dl class="kv">
+                <dt>acumulada</dt>
+                <dd id="cpuSec">&mdash;</dd>
+                <dt>taxa agora</dt>
+                <dd id="cpuRate">&mdash;</dd>
+                <dt>n&uacute;cleos (quota/vis&iacute;veis)</dt>
+                <dd id="cpuCores">&mdash;</dd>
+            </dl>
+        </div>
+        <div class="panel">
+            <div class="dim">PROCESSO</div>
+            <dl class="kv">
+                <dt>PID</dt>
+                <dd id="pid">&mdash;</dd>
+                <dt>RSS</dt>
+                <dd id="rss">&mdash;</dd>
+                <dt>cpu do proc</dt>
+                <dd id="procCpu">&mdash;</dd>
+            </dl>
+        </div>
+        <div class="panel">
+            <div class="dim">HOST (refer&ecirc;ncia)</div>
+            <dl class="kv">
+                <dt>RAM livre / total</dt>
+                <dd id="hostMem">&mdash;</dd>
+                <dt>load 1/5/15</dt>
+                <dd id="load">&mdash;</dd>
+                <dt>uptime</dt>
+                <dd id="uptime">&mdash;</dd>
+                <dt>cpus</dt>
+                <dd id="hostCpus">&mdash;</dd>
+            </dl>
+        </div>
+        <div class="panel">
+            <div class="dim">REDE (&darr; / &uarr;)</div>
+            <canvas class="spark" id="netSpark" width="280" height="46"></canvas>
+            <dl class="kv">
+                <dt>total rx</dt>
+                <dd id="rx">&mdash;</dd>
+                <dt>total tx</dt>
+                <dd id="tx">&mdash;</dd>
+            </dl>
+        </div>
+        <div class="panel">
+            <div class="dim">CGROUP / NOTA</div>
+            <dl class="kv">
+                <dt>cgroup</dt>
+                <dd id="cg">&mdash;</dd>
+            </dl>
+            <div class="muted" id="note" style="margin-top:.4rem"></div>
+        </div>
+    </div>
+    <div class="row">
+        <button id="reloadSys" class="ghost">&#8635; atualizar</button>
+        <label><input type="checkbox" id="autoSys" checked> auto (2s)</label>
+        <span class="muted" id="sysStatus"></span>
+    </div>
+
+    <h2>Modelo na mem&oacute;ria (Ollama /api/ps)</h2>
+    <div class="panel" id="ps"><span class="muted">carregando&hellip;</span></div>
+
+    <h2>Benchmark de gera&ccedil;&atilde;o</h2>
+    <div class="panel">
+        <div class="row">
+            <input id="prompt" size="40" placeholder="prompt (opcional)">
+        </div>
+        <div class="row">
+            <label>runs <input id="runs" type="number" value="3" min="1" max="20" style="width:4.5rem"></label>
+            <label>num_ctx <input id="numctx" type="number" value="4096" min="512" step="512" style="width:5.5rem"></label>
+            <label>keep_alive
+                <select id="ka">
+                    <option value="">padr&atilde;o</option>
+                    <option value="-1">-1 (fixa)</option>
+                    <option value="30s">30s</option>
+                    <option value="0">0 (descarrega)</option>
+                </select>
+            </label>
+            <label>think
+                <select id="think">
+                    <option value="">padr&atilde;o</option>
+                    <option value="off">off</option>
+                    <option value="on">on</option>
+                </select>
+            </label>
+            <button id="runBench">&#9654; rodar bench</button>
+        </div>
+        <div class="muted">Roda gera&ccedil;&otilde;es reais em sequ&ecirc;ncia &mdash; pode levar de segundos a minutos.</div>
+        <div id="bench" style="margin-top:.7rem"></div>
+    </div>
+
+    <p class="muted">GPU/VRAM n&atilde;o s&atilde;o expostos pela API do Ollama (<code>/metrics</code>
+        retorna 404); use <code>load_ms</code> no bench como proxy do custo de carga do modelo.</p>
+
+    <script>
+        const $ = id => document.getElementById(id);
+        const fmt = n => (n === null || n === undefined) ? "\u2014" : n;
+
+        function spark(canvas, series, color) {
+            const ctx = canvas.getContext("2d");
+            const w = canvas.width, h = canvas.height;
+            ctx.clearRect(0, 0, w, h);
+            if (!series.length) return;
+            const max = Math.max(...series, 1e-9), min = Math.min(...series, 0);
+            const span = (max - min) || 1;
+            ctx.strokeStyle = color || "#4bd4e0";
+            ctx.lineWidth = 1.2;
+            ctx.beginPath();
+            series.forEach((v, i) => {
+                const x = (i / (series.length - 1 || 1)) * (w - 2) + 1;
+                const y = h - 1 - ((v - min) / span) * (h - 2);
+                i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+            });
+            ctx.stroke();
+        }
+
+        function setBar(barId, pctEl, pct, label, color) {
+            const bar = $(barId), fill = bar.querySelector("i");
+            const p = (pct == null) ? 0 : Math.max(0, Math.min(100, pct));
+            fill.style.setProperty("--pct", p + "%");
+            fill.style.setProperty("--c", color || (p > 85 ? "#f07178" : p > 60 ? "#e6d06a" : "#4bd4e0"));
+            $(pctEl).textContent = label;
+        }
+
+        const hist = { cpuRate: [], netRate: [] };
+        let prev = {};
+
+        async function loadSys() {
+            try {
+                const r = await fetch("/system/stats");
+                const j = await r.json();
+                const c = j.container || {}, m = c.memory || {}, cpu = c.cpu || {};
+                const p = j.process || {}, h = j.host || {}, hm = h.memory || {}, net = j.network || {};
+
+                const pct = m.pct_of_limit != null ? m.pct_of_limit
+                    : (m.used_bytes != null && hm.total_bytes ? (m.used_bytes / hm.total_bytes) * 100 : null);
+                setBar("memBar", "memPct", pct,
+                    m.pct_of_limit != null ? m.pct_of_limit + "%"
+                        : (m.used_human || "\u2014") + (pct != null ? " \u00b7 sem limite" : ""));
+                $("memUsed").textContent = fmt(m.used_human);
+                $("memCache").textContent = m.cache_bytes != null ? _human(m.cache_bytes) : "\u2014";
+                $("memLimit").textContent = m.limit_human || "sem limite";
+
+                const now = Date.now() / 1000;
+                let rate = null;
+                if (prev.t != null && cpu.cpu_seconds_total != null) {
+                    const dt = now - prev.t, dc = cpu.cpu_seconds_total - prev.cpu;
+                    if (dt > 0 && dc >= 0) rate = (dc / dt) * 100;
+                }
+                prev.t = now; prev.cpu = cpu.cpu_seconds_total;
+                if (rate != null) { hist.cpuRate.push(rate); if (hist.cpuRate.length > 60) hist.cpuRate.shift(); }
+                spark($("cpuSpark"), hist.cpuRate, "#7ee08a");
+                $("cpuSec").textContent = fmt(cpu.cpu_seconds_total) + " s";
+                $("cpuRate").textContent = rate != null ? rate.toFixed(1) + " %" : "\u2014";
+                $("cpuCores").textContent = fmt(cpu.cores_quota) + " / " + fmt(cpu.cores_visible);
+
+                $("pid").textContent = fmt(p.pid);
+                $("rss").textContent = fmt(p.rss_human);
+                $("procCpu").textContent = p.cpu_seconds != null ? p.cpu_seconds + " s" : "\u2014";
+
+                $("hostMem").textContent = (hm.available_human || "?") + " / " + (hm.total_human || "?");
+                $("load").textContent = [h.loadavg?.load_1, h.loadavg?.load_5, h.loadavg?.load_15].map(fmt).join(" / ");
+                $("uptime").textContent = _up(h.uptime_s);
+                $("hostCpus").textContent = fmt(h.cpus);
+
+                $("rx").textContent = fmt(net.rx_human);
+                $("tx").textContent = fmt(net.tx_human);
+                const tot = (net.rx_bytes || 0) + (net.tx_bytes || 0);
+                if (prev.net != null && net.rx_bytes != null) {
+                    const d = tot - prev.net; if (d >= 0) { hist.netRate.push(d); if (hist.netRate.length > 60) hist.netRate.shift(); }
+                }
+                prev.net = tot;
+                spark($("netSpark"), hist.netRate, "#6aa9e0");
+
+                $("cg").textContent = "v" + fmt(j.cgroup_version);
+                $("note").textContent = j.note || "";
+                $("sysStatus").textContent = "ok " + new Date().toLocaleTimeString("pt-BR");
+            } catch (e) {
+                $("sysStatus").innerHTML = '<span class="err">falha: ' + e + "</span>";
+            }
+        }
+
+        function _human(b) {
+            if (b == null) return "\u2014";
+            const u = ["B", "KiB", "MiB", "GiB", "TiB"]; let i = 0, n = b;
+            while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+            return (i ? n.toFixed(1) : n) + " " + u[i];
+        }
+        function _up(s) {
+            if (s == null) return "\u2014";
+            const d = Math.floor(s / 86400), hh = Math.floor(s % 86400 / 3600), mm = Math.floor(s % 3600 / 60);
+            return (d ? d + "d " : "") + hh + "h " + mm + "m";
+        }
+
+        async function loadPs() {
+            const el = $("ps");
+            try {
+                const r = await fetch("/llm/version");
+                const j = await r.json();
+                const ps = j.process_check || {};
+                if (!ps.ok) {
+                    el.innerHTML = '<span class="muted">indispon&iacute;vel (' + (j.reason || ps.error || ps.status || "?") + ").</span>";
+                    return;
+                }
+                if (!ps.loaded_count) {
+                    el.innerHTML = '<span class="muted">nenhum modelo quente (cold). O primeiro generate paga o load &mdash; veja <code>load_ms</code> no bench.</span>';
+                    return;
+                }
+                el.innerHTML = "<table><tr><th>modelo</th><th>em mem&oacute;ria</th></tr>" +
+                    (ps.loaded || []).map(x => "<tr><td>" + (x.name || "?") + "</td><td>" +
+                        (x.size_vram ? (x.size_vram / 1e9).toFixed(2) + " GB" : "\u2014") + "</td></tr>").join("") + "</table>";
+            } catch (e) {
+                el.innerHTML = '<span class="err">falha ao ler estado do modelo: ' + e + "</span>";
+            }
+        }
+
+        async function runBench() {
+            const btn = $("runBench"), out = $("bench");
+            btn.disabled = true;
+            out.innerHTML = '<span class="muted">rodando ' + $("runs").value + " geracoes&hellip; aguarde.</span>";
+            const q = new URLSearchParams();
+            const pr = $("prompt").value.trim(); if (pr) q.set("prompt", pr);
+            q.set("runs", $("runs").value);
+            const nc = $("numctx").value; if (nc) q.set("num_ctx", nc);
+            const ka = $("ka").value; if (ka) q.set("keep_alive", ka);
+            const th = $("think").value; if (th) q.set("think", th);
+            try {
+                const r = await fetch("/bench?" + q.toString());
+                const j = await r.json();
+                if (!j.ok && j.reason) { out.innerHTML = '<span class="err">' + j.reason + "</span>"; return; }
+                const agg = k => j[k] || {};
+                const row = (nome, a, un) => "<tr><td>" + nome + "</td><td>" + fmt(a.p50) + un +
+                    "</td><td>" + fmt(a.p95) + un + "</td><td>" + fmt(a.min) + un +
+                    "</td><td>" + fmt(a.max) + un + "</td></tr>";
+                out.innerHTML = '<div class="muted">ok_runs ' + j.ok_runs + "/" + j.runs +
+                    " &middot; " + (j._meta?.elapsed_ms || "?") + " ms" +
+                    (j.last_error ? ' &middot; <span class="err">erro: ' + j.last_error + "</span>" : "") + "</div>" +
+                    "<table><tr><th>m&eacute;trica</th><th>p50</th><th>p95</th><th>min</th><th>max</th></tr>" +
+                    row("TTFT", agg("ttft_ms"), " ms") +
+                    row("Throughput", agg("eval_tps"), " tok/s") +
+                    row("Carga modelo", agg("load_ms"), " ms") +
+                    row("Total servidor", agg("total_ms"), " ms") +
+                    row("Parede (cliente)", agg("wall_ms"), " ms") + "</table>";
+                loadPs();
+            } catch (e) {
+                out.innerHTML = '<span class="err">falha no /bench: ' + e + "</span>";
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        let timer = null;
+        function tick() { if (!document.hidden) loadSys(); }
+        function setupAuto() {
+            clearInterval(timer);
+            if ($("autoSys").checked) timer = setInterval(tick, 2000);
+        }
+        document.addEventListener("visibilitychange", () => { if (!document.hidden) loadSys(); });
+        $("reloadSys").onclick = loadSys;
+        $("autoSys").onchange = setupAuto;
+        $("runBench").onclick = runBench;
+        loadSys(); loadPs(); setupAuto();
+    </script>
+</body>
+
+</html>

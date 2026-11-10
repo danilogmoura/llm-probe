@@ -329,6 +329,28 @@ try:
 finally:
     app.LLM_MODEL = _m
 
+# --- autopsia do container + rotas /system/stats e /perf -------------------
+check("_parse_mem_bytes('max') -> None (sem limite)",
+      app._parse_mem_bytes("max") is None, "")
+check("_parse_mem_bytes numerico", app._parse_mem_bytes("1048576") == 1048576, "")
+check("_parse_mem_bytes sentinela gigante -> None",
+      app._parse_mem_bytes(str((1 << 63) - 1)) is None, "")
+check("_read_first pega 1a linha com strip", app._read_first("  oi  \nnao") == "oi", "")
+check("_read_first 1a linha vazia -> None", app._read_first("\n  oi ") is None, "")
+st = app.system_stats()
+check("/system/stats estrutura ok",
+      st.get("ok") is True and "container" in st and "process" in st and "host" in st,
+      f"cgroup v{st.get('cgroup_version')}")
+check("system_stats nao vaza hostname/IP/credencial",
+      not any(k in str(st).lower() for k in ("hostname", "environ", "cookie")), "")
+r = client.get("/system/stats")
+check("GET /system/stats -> 200 JSON", r.status_code == 200 and r.get_json().get("app") == "probe-llm",
+      str(r.status_code))
+r = client.get("/perf")
+body = r.get_data(as_text=True)
+check("GET /perf -> 200 HTML", r.status_code == 200 and "/system/stats" in body and "/bench" in body,
+      str(r.status_code))
+
 print("\nRESULTADO:", "TODOS PASSARAM" if all(c for _, c in results) else "HOUVE FALHAS")
 print(f"{sum(1 for _, c in results if c)}/{len(results)} checks OK")
 for n, c in results:
