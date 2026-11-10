@@ -45,6 +45,18 @@ SHOW_BODY = {
     "size": 5_899_000_000,
 }
 
+# Sequencia NDJSON que um /api/generate?stream=true real devolveria: chunks de
+# texto e o chunk final 'done' com duracoes em NANOSEGUNDOS e contagem de tokens.
+GEN_STREAM = [
+    {"response": "Ola", "done": False},
+    {"response": " mundo", "done": False},
+    {"response": "!", "done": False},
+    {"done": True, "total_duration": 1_200_000_000,
+     "load_duration": 300_000_000, "prompt_eval_count": 10,
+     "prompt_eval_duration": 100_000_000, "eval_count": 40,
+     "eval_duration": 800_000_000},
+]
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -69,6 +81,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/api/show":
             self._send(SHOW_BODY)
+        elif self.path == "/api/generate":
+            # Streaming NDJSON fake: um chunk de resposta + chunk final com as
+            # metricas nativas do Ollama (nanossegundos), como o servidor real.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            for line in GEN_STREAM:
+                self.wfile.write((json.dumps(line) + "\n").encode())
+            self.wfile.flush()
         else:
             self._send({"error": "not found"}, 404)
 
@@ -238,6 +259,75 @@ try:
 finally:
     app.WARMUP_ATTEMPTS, app.WARMUP_BUDGET, app.LLM_MODEL = oa, ob, om
     app.LLM_URL = "http://127.0.0.1:8777"
+
+# --------------------------------------------------------------------------
+# Metricas nativas do Ollama + bench/sweep (passos 1-3).
+# --------------------------------------------------------------------------
+# _ollama_stats: converte nanossegundos->ms e calcula tokens/s a partir do chunk
+# final. eval_count=40 em eval_duration=800ms -> 50.0 tps; load=300ms.
+st = app._ollama_stats({k: v for line in GEN_STREAM if line.get("done")
+                        for k, v in line.items()})
+check("stats: total_ms de ns", st["total_ms"] == 1200, str(st["total_ms"]))
+check("stats: load_ms de ns", st["load_ms"] == 300, str(st["load_ms"]))
+check("stats: eval_tps = count/dur_s", st["eval_tps"] == 50.0, str(st["eval_tps"]))
+check("stats: prompt_tps", st["prompt_tps"] == 100.0, str(st["prompt_tps"]))
+check("stats: eval_count preservado", st["eval_count"] == 40, "")
+# corpo sem metricas -> tudo None, sem excecao.
+st_empty = app._ollama_stats({})
+check("stats: ausentes viram None",
+      all(st_empty[k] is None for k in ("total_ms", "eval_tps", "eval_count")), "")
+
+# _percentile: mediana e p95 por interpolacao linear.
+check("percentile: p50 impar", app._percentile([1, 2, 3, 4, 5], 50) == 3, "")
+check("percentile: p95 interp", app._percentile([10, 20], 95) == 19.5,
+      str(app._percentile([10, 20], 95)))
+check("percentile: vazio -> None", app._percentile([], 50) is None, "")
+check("percentile: ignora nao-numericos",
+      app._percentile([1, None, 3, "x"], 50) == 2.0,
+      str(app._percentile([1, None, 3, "x"], 50)))
+
+# _split_csv / _parse_int_list: parsing defensivo de query.
+check("csv: default quando vazio", app._split_csv(None, ["a"]) == ["a"], "")
+check("csv: limpa espacos e vazios",
+      app._split_csv(" x , ,y ") == ["x", "y"], "")
+check("intlist: descarta invalidos",
+      app._parse_int_list("2048,abc,8192") == [2048, 8192], "")
+check("intlist: default se nada valida",
+      app._parse_int_list("abc", [1, 2]) == [1, 2], "")
+
+# _bench_generate contra o fake NDJSON: TTFT presente, texto acumulado, metricas.
+app.LLM_URL = "http://127.0.0.1:8777"
+bg = app._bench_generate("oi", think=False)
+check("bench_gen: ok", bg.get("ok") is True, str(bg)[:120])
+check("bench_gen: ttft_ms presente", isinstance(bg.get("ttft_ms"), int), "")
+check("bench_gen: chars = 10 ('Ola mundo!')", bg.get("chars") == 10, str(bg.get("chars")))
+check("bench_gen: eval_tps propagado", bg.get("eval_tps") == 50.0, str(bg.get("eval_tps")))
+check("bench_gen: thinking_seen False", bg.get("thinking_seen") is False, "")
+
+# _bench_runs agrega p50/p95 sobre varios runs identicos.
+br = app._bench_runs("oi", think=False, runs=3)
+check("bench_runs: 3 ok", br["runs"] == 3 and br["ok_runs"] == 3, str(br)[:120])
+check("bench_runs: p50 de eval_tps", br["eval_tps"]["p50"] == 50.0,
+      str(br["eval_tps"]))
+check("bench_runs: per_run tem 3", len(br["per_run"]) == 3, "")
+
+# Rota /bench via test_client (usa o fake de generate).
+rb = client.get("/bench?runs=2&num_ctx=4096&keep_alive=-1&think=off")
+jb = rb.get_json()
+check("/bench: HTTP 200", rb.status_code == 200, str(rb.status_code))
+check("/bench: meta com num_ctx", jb["_meta"]["options"] == {"num_ctx": 4096},
+      str(jb.get("_meta")))
+check("/bench: keep_alive repassado", jb["_meta"]["keep_alive"] == "-1", "")
+check("/bench: agregado presente", jb["eval_tps"]["p50"] == 50.0, str(jb["eval_tps"]))
+
+# Sem LLM_MODEL -> 503 honesto.
+_m = app.LLM_MODEL
+try:
+    app.LLM_MODEL = ""
+    check("/bench sem model -> 503",
+          client.get("/bench").status_code == 503, "")
+finally:
+    app.LLM_MODEL = _m
 
 print("\nRESULTADO:", "TODOS PASSARAM" if all(c for _, c in results) else "HOUVE FALHAS")
 print(f"{sum(1 for _, c in results if c)}/{len(results)} checks OK")

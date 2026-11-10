@@ -17,6 +17,7 @@ processo em primeiro plano, sem VOLUME.
 """
 
 import json
+import math
 import os
 import re
 import socket
@@ -87,6 +88,18 @@ WARMUP_INTERVAL = float(os.environ.get("WARMUP_INTERVAL", "10"))
 # simplesmente MORTA - muito mais que a janela de 1-2 min do manual. Ao exceder,
 # a thread para e marca 'failed' com motivo 'budget esgotado'.
 WARMUP_BUDGET = float(os.environ.get("WARMUP_BUDGET", "300"))
+
+# --------------------------------------------------------------------------
+# Bench / sweep (metricas de performance). Valores padrao conservadores: um
+# /bench ou /sweep e uma SEQUENCIA de geracoes reais, entao pode demorar muito.
+# BENCH_RUNS  : quantas geracoes por ponto do bench.
+# BENCH_PROMPT: pergunta padrao quando a query nao informa prompt.
+# SWEEP_MAX_POINTS: teto de combinacoes num_ctx x keep_alive p/ limitar tempo.
+# --------------------------------------------------------------------------
+BENCH_RUNS = int(os.environ.get("BENCH_RUNS", "3"))
+BENCH_PROMPT = os.environ.get(
+    "BENCH_PROMPT", "Explique em duas frases o que faz um servidor HTTP.")
+SWEEP_MAX_POINTS = int(os.environ.get("SWEEP_MAX_POINTS", "12"))
 
 _parsed = urlparse(LLM_URL)
 HOST = _parsed.hostname or ""
@@ -235,6 +248,9 @@ def step_generate(prompt="Qual e 2+2? Responda so o numero.", think=None, timeou
                "thinking": body.get("thinking"),
                "total_ms": total_ms,
                "ms": round((time.time() - t0) * 1000)}
+        # Metricas nativas do Ollama (chunk final): throughput real do servidor,
+        # custo de carga do modelo (efeito do keep_alive) e contagem de tokens.
+        out["stats"] = _ollama_stats(body)
         if not resp.ok:
             # Alguns modelos recusam 'think' com 400; guardar o erro bruto.
             out["error_body"] = str(body)[:500]
@@ -268,6 +284,7 @@ def step_generate_stream(prompt, think=None):
     if think is not None:
         payload["think"] = think
     t0 = time.time()
+    ttft_ms = None  # tempo ate o PRIMEIRO chunk com conteudo (thinking ou resposta)
     try:
         with requests.post(url, json=payload, stream=True,
                            timeout=_net_timeout(), verify=False) as resp:
@@ -282,16 +299,18 @@ def step_generate_stream(prompt, think=None):
                     obj = json.loads(raw)
                 except ValueError:
                     continue
+                if ttft_ms is None and (obj.get("thinking") or obj.get("response")):
+                    ttft_ms = round((time.time() - t0) * 1000)
                 evt = {"event": "token"}
                 if obj.get("thinking"):
                     evt["thinking"] = obj["thinking"]
                 if obj.get("response"):
                     evt["response"] = obj["response"]
                 if obj.get("done"):
-                    ns = obj.get("total_duration")
                     evt = {"event": "done",
-                           "total_ms": round(ns / 1_000_000) if isinstance(ns, (int, float)) else None,
-                           "wall_ms": round((time.time() - t0) * 1000)}
+                           "wall_ms": round((time.time() - t0) * 1000),
+                           "ttft_ms": ttft_ms,
+                           "stats": _ollama_stats(obj)}
                 yield _sse(evt)
     except requests.RequestException as exc:
         yield _sse({"event": "error",
@@ -299,8 +318,177 @@ def step_generate_stream(prompt, think=None):
                     "wall_ms": round((time.time() - t0) * 1000)})
 
 
+def _bench_generate(prompt, think=None, options=None, keep_alive=None):
+    """Uma geracao de BENCH (streaming) que retorna um resumo com metricas.
+
+    Reaproveita o streaming real (mesmo caminho do /chat e do warmup) para medir
+    o que o servidor faz de verdade: TTFT no primeiro chunk com conteudo e as
+    metricas nativas do Ollama no chunk final. Nao e SSE: acumula em memoria e
+    devolve um dict, porque /bench e /sweep precisam do resultado agregado.
+    'options' vai cru para /api/generate (ex.: {"num_ctx":4096}); 'keep_alive'
+    controla a permanencia do modelo na VRAM ('30s', '-1', 0). Erro de rede vira
+    ok=False em vez de excecao, para o bench continuar os proximos runs."""
+    if not LLM_MODEL:
+        return {"ok": False, "reason": "LLM_MODEL nao definido"}
+    url = f"{LLM_URL}/api/generate"
+    payload = {"model": LLM_MODEL, "prompt": prompt, "stream": True}
+    if think is not None:
+        payload["think"] = think
+    if options:
+        payload["options"] = options
+    if keep_alive is not None:
+        payload["keep_alive"] = keep_alive
+    t0 = time.time()
+    ttft_ms = None
+    text_parts = []
+    thinking_seen = False
+    stats = {}
+    try:
+        with requests.post(url, json=payload, stream=True,
+                           timeout=_net_timeout(), verify=False) as resp:
+            if not resp.ok:
+                return {"ok": False, "status": resp.status_code,
+                        "error_body": resp.text[:300],
+                        "wall_ms": round((time.time() - t0) * 1000)}
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except ValueError:
+                    continue
+                if ttft_ms is None and (obj.get("thinking") or obj.get("response")):
+                    ttft_ms = round((time.time() - t0) * 1000)
+                if obj.get("thinking"):
+                    thinking_seen = True
+                if obj.get("response"):
+                    text_parts.append(obj["response"])
+                if obj.get("done"):
+                    stats = _ollama_stats(obj)
+    except requests.RequestException as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                "wall_ms": round((time.time() - t0) * 1000)}
+    wall_ms = round((time.time() - t0) * 1000)
+    text = "".join(text_parts)
+    out = {"ok": True, "ttft_ms": ttft_ms, "wall_ms": wall_ms,
+           "chars": len(text), "thinking_seen": thinking_seen}
+    out.update(stats)
+    return out
+
+
+def _bench_runs(prompt, think=None, runs=1, options=None, keep_alive=None):
+    """Executa N geracoes iguais e agrega p50/p95/min/max das metricas-chave.
+
+    Um ponto de bench = varios runs do MESMO setup; a mediana (p50) e o pico
+    (p95) resumem a distribuicao sem numpy. Retorna tambem a lista crua de runs
+    para inspecao. Cada run ja captura seu proprio erro (ok=False) sem abortar o
+    conjunto."""
+    resultados = [_bench_generate(prompt, think=think, options=options,
+                                  keep_alive=keep_alive)
+                  for _ in range(max(1, runs))]
+    bons = [r for r in resultados if r.get("ok")]
+
+    def agg(campo):
+        vals = [r[campo] for r in bons if isinstance(r.get(campo), (int, float))]
+        if not vals:
+            return {"p50": None, "p95": None, "min": None, "max": None}
+        return {"p50": _percentile(vals, 50), "p95": _percentile(vals, 95),
+                "min": round(min(vals), 2), "max": round(max(vals), 2)}
+
+    return {
+        "runs": len(resultados),
+        "ok_runs": len(bons),
+        "failed_runs": len(resultados) - len(bons),
+        "ttft_ms": agg("ttft_ms"),
+        "total_ms": agg("total_ms"),
+        "wall_ms": agg("wall_ms"),
+        "eval_tps": agg("eval_tps"),
+        "load_ms": agg("load_ms"),
+        "last_error": next((r.get("error") or r.get("reason") or
+                            r.get("error_body") for r in resultados
+                            if not r.get("ok")), None),
+        "per_run": resultados,
+    }
+
+
 def _sse(data):
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _ns_to_ms(v):
+    """Converte nanosegundos (formato Ollama) em ms inteiro; None se ausente/ruim."""
+    return round(v / 1_000_000) if isinstance(v, (int, float)) and v >= 0 else None
+
+
+def _safe_rate(count, dur_ms):
+    """tokens/s a partir de contagem e duracao em ms; None se dados insuficientes."""
+    if not isinstance(count, (int, float)) or count <= 0:
+        return None
+    if not isinstance(dur_ms, (int, float)) or dur_ms <= 0:
+        return None
+    return round(count / (dur_ms / 1000.0), 2)
+
+
+def _ollama_stats(body):
+    """Extrai as metricas nativas do chunk final do Ollama (campos *_duration em
+    NANOSEGUNDOS e *_count em tokens).
+
+    Devolve um dict enxuto p/ consumo por /bench e /sweep: throughput real de
+    geracao (eval_count/eval_duration), custo de carga do modelo (load_duration,
+    que revela o efeito do keep_alive) e contagens de tokens. Campos ausentes
+    viram None em vez de quebrar - nem todo build/version preenche tudo."""
+    total_ms = _ns_to_ms(body.get("total_duration"))
+    load_ms = _ns_to_ms(body.get("load_duration"))
+    eval_ms = _ns_to_ms(body.get("eval_duration"))
+    prompt_eval_ms = _ns_to_ms(body.get("prompt_eval_duration"))
+    eval_count = body.get("eval_count")
+    prompt_eval_count = body.get("prompt_eval_count")
+    return {
+        "total_ms": total_ms,
+        "load_ms": load_ms,
+        "eval_ms": eval_ms,
+        "prompt_eval_ms": prompt_eval_ms,
+        "eval_count": eval_count,
+        "prompt_eval_count": prompt_eval_count,
+        "eval_tps": _safe_rate(eval_count, eval_ms),
+        "prompt_tps": _safe_rate(prompt_eval_count, prompt_eval_ms),
+    }
+
+
+def _percentile(vals, pct):
+    """Percentil simples (interp linear) sobre lista ja ordenada de numeros.
+    None se vazia. Usado p/ p50/p95 do /bench sem depender de numpy."""
+    nums = sorted(v for v in vals if isinstance(v, (int, float)))
+    if not nums:
+        return None
+    if len(nums) == 1:
+        return round(float(nums[0]), 2)
+    k = (len(nums) - 1) * (pct / 100.0)
+    lo = int(math.floor(k))
+    hi = min(lo + 1, len(nums) - 1)
+    frac = k - lo
+    return round(nums[lo] + (nums[hi] - nums[lo]) * frac, 2)
+
+
+def _split_csv(raw, default=None):
+    """Divide 'a,b,c' em lista de strings limpas; usa default se vazio/None."""
+    if not raw:
+        return list(default or [])
+    parts = [p.strip() for p in str(raw).split(",")]
+    parts = [p for p in parts if p != ""]
+    return parts or list(default or [])
+
+
+def _parse_int_list(raw, default=None):
+    """Como _split_csv mas convertendo cada item em int; descarta nao-numericos.
+    Se nada validar, devolve default."""
+    out = []
+    for p in _split_csv(raw, default=None):
+        try:
+            out.append(int(p))
+        except ValueError:
+            continue
+    return out or list(default or [])
 
 
 def _openai_headers():
@@ -627,7 +815,8 @@ def step_env():
             "PROBE_BUDGET", "CHAT_BUDGET", "PORT", "PROBE_PROMPT",
             "LLM_API_KEY",
             "WARMUP_ENABLED", "WARMUP_PROMPT", "WARMUP_TIMEOUT",
-            "WARMUP_ATTEMPTS", "WARMUP_INTERVAL", "WARMUP_BUDGET"]
+            "WARMUP_ATTEMPTS", "WARMUP_INTERVAL", "WARMUP_BUDGET",
+            "BENCH_RUNS", "BENCH_PROMPT", "SWEEP_MAX_POINTS"]
     return {
         "ok": True,
         "app": APP_NAME,
@@ -644,6 +833,7 @@ def step_env():
             "status": _estado_warmup().get("status"),
             "attempts": _estado_warmup().get("attempts"),
         },
+        "bench": {"runs": BENCH_RUNS, "max_points": SWEEP_MAX_POINTS},
         "constraint": "todos os budgets devem ficar ABAIXO do gunicorn --timeout",
         "vars": {k: present(k) for k in keys},
         "count_total_env": len(os.environ),
@@ -815,6 +1005,9 @@ def home():
         "<b>OpenAI-compat:</b> /llm/openai-compat (testa /v1/models e "
         "/v1/chat/completions)<br>"
         "<b>Versao:</b> /llm/version (identifica a versao do Ollama)<br>"
+        "<b>Performance:</b> /bench?runs=3&num_ctx=4096&keep_alive=-1 "
+        "(TTFT/tokens-s/p50-p95) &middot; /sweep?num_ctx_list=2048,8192 "
+        "&amp;keep_alive_list=0,-1 (varre parametros)<br>"
         '<a href="/chat">Ir para a pagina de perguntas (chat)</a>'
     )
 
@@ -923,6 +1116,106 @@ def probe_generate_stream():
                     mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache",
                              "X-Accel-Buffering": "no"})
+
+
+@app.get("/bench")
+def bench():
+    """Benchmark sequencial: N geracoes iguais -> TTFT, tokens/s, p50/p95.
+
+    Mede o throughput REAL do servidor (do chunk final do Ollama) e o tempo ate
+    o primeiro token, repetindo o mesmo setup 'runs' vezes e agregando mediana e
+    pico. ATENCAO: roda geracoes reais em SEQUENCIA, entao pode levar minutos -
+    mantem-se abaixo do --timeout do gunicorn porque cada run e streaming (a
+    conexao fica viva enquanto chegam bytes). Parametros de query:
+      prompt   : texto a enviar (default BENCH_PROMPT)
+      runs     : quantas geracoes (default BENCH_RUNS)
+      think    : on|off (omitido = nao envia o campo)
+      num_ctx  : janela de contexto (vai em options.num_ctx)
+      keep_alive: permanencia na VRAM ('30s', '-1', '0')
+    Uso: /bench?runs=3&num_ctx=4096&keep_alive=-1&think=off"""
+    if not LLM_MODEL:
+        return jsonify(ok=False,
+                       reason="LLM_MODEL nao definido - nada para medir"), 503
+    prompt = req.args.get("prompt", BENCH_PROMPT)
+    try:
+        runs = int(req.args.get("runs", BENCH_RUNS))
+    except ValueError:
+        runs = BENCH_RUNS
+    runs = max(1, min(runs, 20))  # teto duro p/ nao estourar o worker
+    think = _parse_think(req.args.get("think"))
+    options = {}
+    if req.args.get("num_ctx"):
+        try:
+            options["num_ctx"] = int(req.args["num_ctx"])
+        except ValueError:
+            pass
+    keep_alive = req.args.get("keep_alive")
+    t_start = time.time()
+    resumo = _bench_runs(prompt, think=think, runs=runs,
+                         options=options or None, keep_alive=keep_alive)
+    resumo["_meta"] = {
+        "model": LLM_MODEL, "prompt_chars": len(prompt),
+        "think_sent": think, "options": options or None,
+        "keep_alive": keep_alive,
+        "elapsed_ms": round((time.time() - t_start) * 1000),
+        "note": ("metricas vem do chunk final do Ollama (servidor); TTFT medido "
+                 "no cliente. eval_tps = tokens de saida/s. load_ms alto = modelo "
+                 "sendo recarregado (keep_alive curto)."),
+    }
+    return jsonify(resumo)
+
+
+@app.get("/sweep")
+def sweep():
+    """Varredura de parametros: testa combinacoes de num_ctx x keep_alive e
+    reporta as metricas de cada ponto. Serve para escolher configuracao.
+
+    Cada ponto roda 1 geracao (barato mas real) e guarda TTFT/tokens/s/load_ms.
+    O produto num_ctx x keep_alive e limitado por SWEEP_MAX_POINTS para o request
+    inteiro caber no --timeout. Valores default das queries:
+      num_ctx_list   : 2048,4096,8192
+      keep_alive_list: 30s,-1
+      think          : off (esquenta sem raciocinio longo)
+      prompt         : BENCH_PROMPT
+    Uso: /sweep?num_ctx_list=2048,8192&keep_alive_list=0,-1"""
+    if not LLM_MODEL:
+        return jsonify(ok=False,
+                       reason="LLM_MODEL nao definido - nada para medir"), 503
+    ctx_vals = _parse_int_list(req.args.get("num_ctx_list"),
+                               default=[2048, 4096, 8192])
+    ka_vals = _split_csv(req.args.get("keep_alive_list"), default=["30s", "-1"])
+    think = _parse_think(req.args.get("think")) or False
+    prompt = req.args.get("prompt", BENCH_PROMPT)
+    pontos = []
+    for ctx in ctx_vals:
+        for ka in ka_vals:
+            if len(pontos) >= SWEEP_MAX_POINTS:
+                break
+            pontos.append({"num_ctx": ctx, "keep_alive": ka})
+        else:
+            continue
+        break
+    cortado = len(ctx_vals) * len(ka_vals) > len(pontos)
+    resultados = []
+    for p in pontos:
+        r = _bench_generate(prompt, think=think,
+                            options={"num_ctx": p["num_ctx"]},
+                            keep_alive=p["keep_alive"])
+        resultados.append({
+            "num_ctx": p["num_ctx"], "keep_alive": p["keep_alive"],
+            "ok": r.get("ok"), "ttft_ms": r.get("ttft_ms"),
+            "total_ms": r.get("total_ms"), "load_ms": r.get("load_ms"),
+            "eval_tps": r.get("eval_tps"), "eval_count": r.get("eval_count"),
+            "error": r.get("error") or r.get("reason") or r.get("error_body"),
+        })
+    return jsonify({
+        "ok": True, "model": LLM_MODEL, "think_sent": think,
+        "points_run": len(resultados), "truncated_by_max_points": cortado,
+        "max_points": SWEEP_MAX_POINTS, "results": resultados,
+        "note": ("compare eval_tps (throughput) e load_ms (carga de VRAM) entre "
+                 "os pontos; keep_alive=0 descarrega apos cada chamada, -1 fixa."),
+    })
+
 
 
 @app.get("/env")

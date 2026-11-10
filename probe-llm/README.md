@@ -55,6 +55,9 @@ PROBE_BUDGET=55
 | `WARMUP_ATTEMPTS` | `8` | Máximo de tentativas de aquecimento antes de marcar `failed`. |
 | `WARMUP_INTERVAL` | `10` | Pausa (s) entre tentativas de aquecimento. |
 | `WARMUP_BUDGET` | `300` | Teto (s) **global** do esforço de aquecimento. Se a LLM estiver morta, o warmup desiste em ~5 min em vez de somar todas as tentativas (~20 min). A pausa nunca ultrapassa o orçamento restante. |
+| `BENCH_RUNS` | `3` | Nº padrão de gerações por ponto no `/bench` (p50/p95). A query `?runs=` sobrepõe; teto duro 20 para não estourar o worker. |
+| `BENCH_PROMPT` | `Explique em duas frases o que faz um servidor HTTP.` | Pergunta padrão de `/bench` e `/sweep` quando `?prompt=` é omitido. |
+| `SWEEP_MAX_POINTS` | `12` | Teto de combinações `num_ctx × keep_alive` no `/sweep`, limitando o tempo total do request. |
 
 - `LLM_URL` e `LLM_MODEL` **não têm default no código** de propósito: o endereço real é
   do ambiente institucional e **não deve ser versionado no repositório público**. Consulte
@@ -73,7 +76,8 @@ PROBE_BUDGET=55
 
 ## Rotas
 
-O app expõe **11 rotas**: as de uso normal (chat + streaming) e as de diagnóstico/aquecimento.
+O app expõe **14 rotas**: as de uso normal (chat + streaming), as de diagnóstico/aquecimento
+e as de performance (`/bench`, `/sweep`).
 A conectividade com a LLM interna é testada pela cascata `/probe` (DNS → TCP → TLS →
 modelo → versão), que roda todas as etapas em ordem num único JSON, sem nunca derrubar o servidor.
 
@@ -142,6 +146,38 @@ modelo → versão), que roda todas as etapas em ordem num único JSON, sem nunc
   (status, latência, preview). Aceita `?stream=off` para pular o teste de streaming. Usa o
   mesmo `Authorization: Bearer` que a biblioteca OpenAI mandaria (placeholder local; nenhum
   segredo é impresso). Atenção: roda duas gerações em série — chame fora da cascata `/probe`.
+
+### Performance (bench / sweep)
+
+Além do diagnóstico de conectividade, o probe mede o **desempenho real** da LLM. As métricas
+vêm do próprio servidor: no último chunk do streaming (`"done": true`), o Ollama devolve
+`total_duration`, `load_duration`, `eval_duration`, `prompt_eval_duration` (todos em
+**nanossegundos**) e `eval_count`/`prompt_eval_count` (tokens). O probe converte para ms e
+calcula throughput — nada é estimado no cliente, exceto o TTFT.
+
+- `GET /bench` → **benchmark sequencial**: repete a mesma geração `runs` vezes e agrega
+  **p50/p95/min/max** das métricas-chave. Parâmetros de query:
+  - `prompt` (default `BENCH_PROMPT`), `runs` (default `BENCH_RUNS`, teto duro 20),
+    `think=on|off`, `num_ctx=<int>` (vai em `options.num_ctx`), `keep_alive=<s|-1|0>`.
+  - Retorna `ttft_ms` (tempo até o primeiro token, medido no cliente), `eval_tps`
+    (tokens/s de saída, do servidor), `load_ms` (custo de carregar o modelo — alto indica
+    `keep_alive` curto / cold start), `total_ms`, além de `per_run` com os runs brutos.
+  - Ex.: `GET /bench?runs=3&num_ctx=4096&keep_alive=-1&think=off`
+- `GET /sweep` → **varredura de parâmetros**: testa o produto `num_ctx_list × keep_alive_list`
+  (1 geração por ponto) e reporta as métricas de cada combinação, para escolher configuração.
+  Limitado por `SWEEP_MAX_POINTS` para caber no `--timeout`. Parâmetros:
+  `num_ctx_list` (default `2048,4096,8192`), `keep_alive_list` (default `30s,-1`),
+  `think` (default `off`), `prompt`.
+  - Ex.: `GET /sweep?num_ctx_list=2048,8192&keep_alive_list=0,-1`
+
+> **Custo:** `/bench` e `/sweep` rodam **gerações reais em série** — podem levar minutos.
+> Assim como `/llm/default-think` e `/llm/openai-compat`, ficam **fora** da cascata `/probe`;
+> chame um por vez. Cada geração usa streaming, então a conexão fica viva enquanto chegam
+> bytes e o worker não é morto pelo `--timeout` enquanto há tokens fluindo.
+
+O evento `done` do SSE de `/llm/generate-stream` agora inclui `ttft_ms` e `stats` (as mesmas
+métricas nativas), e a resposta de `/api/ask` traz `stats` enriquecido — dá para acompanhar
+throughput sem sair do chat.
 
 ## Ordem recomendada para as checagens
 
