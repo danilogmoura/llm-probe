@@ -46,8 +46,15 @@ PROBE_BUDGET=55
 | `CONNECT_TIMEOUT` | `10` | Timeout (s) de **conectividade** (abrir TCP/TLS). Host morto ou porta fechada falha rápido em todas as rotas, sem esperar o `LLM_TIMEOUT` inteiro. |
 | `PROBE_BUDGET` | `55` | Teto (s) da cascata completa do `/probe`. |
 | `CHAT_BUDGET` | `150` | Teto (s) de cada pergunta na página `/chat` (rota `/api/ask`). |
-| `PORT` | `8080` | Porta de escuta (usada no fallback `python app.py`; o gunicorn fixa 8080). |
+| `PORT` | `8080` | Porta de **escuta deste app** (fallback `python app.py`; o gunicorn fixa 8080). A porta do **LLM** vem embutida em `LLM_URL` e vive internamente como `LLM_PORT` — são coisas distintas. |
+| `LLM_API_KEY` | *(sem default)* | Chave opcional para compatibilidade OpenAI (`Authorization: Bearer …`). Se ausente, o probe envia um placeholder; o valor **nunca** é exposto no `/env` (só presença). |
 | `PROBE_PROMPT` | `Qual e 2+2? Responda so o numero.` | Pergunta padrão usada por `/llm/generate-stream` quando `?prompt=` é omitido. |
+| `WARMUP_ENABLED` | `1` | Liga/desliga o aquecimento automático em background no startup. |
+| `WARMUP_PROMPT` | `ping` | Prompt mínimo enviado para esquentar o modelo (sempre com `think=false`). |
+| `WARMUP_TIMEOUT` | `150` | Timeout (s) de leitura de cada tentativa de aquecimento; mantenha abaixo do `--timeout`. |
+| `WARMUP_ATTEMPTS` | `8` | Máximo de tentativas de aquecimento antes de marcar `failed`. |
+| `WARMUP_INTERVAL` | `10` | Pausa (s) entre tentativas de aquecimento. |
+| `WARMUP_BUDGET` | `300` | Teto (s) **global** do esforço de aquecimento. Se a LLM estiver morta, o warmup desiste em ~5 min em vez de somar todas as tentativas (~20 min). A pausa nunca ultrapassa o orçamento restante. |
 
 - `LLM_URL` e `LLM_MODEL` **não têm default no código** de propósito: o endereço real é
   do ambiente institucional e **não deve ser versionado no repositório público**. Consulte
@@ -66,9 +73,9 @@ PROBE_BUDGET=55
 
 ## Rotas
 
-O app expõe **8 rotas**: as de uso normal (chat + streaming) e as de diagnóstico.
+O app expõe **11 rotas**: as de uso normal (chat + streaming) e as de diagnóstico/aquecimento.
 A conectividade com a LLM interna é testada pela cascata `/probe` (DNS → TCP → TLS →
-modelo), que roda todas as etapas em ordem num único JSON, sem nunca derrubar o servidor.
+modelo → versão), que roda todas as etapas em ordem num único JSON, sem nunca derrubar o servidor.
 
 ### Uso normal
 
@@ -90,24 +97,95 @@ modelo), que roda todas as etapas em ordem num único JSON, sem nunca derrubar o
 ### Diagnóstico
 
 - `GET /health` → status simples (porta interna, `LLM_URL` e se `LLM_MODEL` está definido)
-- `GET /ready` → health de **prontidão**: faz um `POST /api/show` barato no `LLM_MODEL`
-  e devolve `200` só quando o **modelo configurado** está de pé; enquanto não estiver,
-  devolve **`503`** com um hint (atende o aviso do manual de que a LLM leva 1–2 min após
-  iniciar). Bom para polling. Checa **só o seu modelo** — não lista os demais.
+- `GET /ready` → health de **prontidão REAL**: devolve `200` apenas quando o modelo já
+  **respondeu de verdade** (cold start pago), não só quando existe. Enquanto o aquecimento
+  em background roda, responde **`503`** com `retry_after_s` (bom para polling); se o
+  aquecimento estiver desligado/falho, cai no teste leve `POST /api/show` para dar um
+  veredito honesto. Nunca bloqueia a request esperando o generate — a espera acontece na
+  thread de warmup. Checa **só o seu modelo** — não lista os demais.
+- `GET /warmup` → mostra o **estado do aquecimento** (`pending/warming/warm/failed/disabled/
+  skipped`), quantas tentativas já rodaram e a configuração efetiva; se ainda não disparou,
+  (re)dispara em background e responde imediato (não espera o generate terminar).
 - `GET /llm/generate-stream` → **streaming SSE** (`text/event-stream`) sobre
   `POST {LLM_URL}/api/generate` com `stream:true`. Aceita `?prompt=` e `?think=on|off`.
   Emite eventos `data: {"event":"token","response":"..."}` (e `thinking` quando ligado)
   até `data: {"event":"done",...}`. É a forma recomendada de gerar com modelo thinking:
   o timeout vira *inatividade* (tempo entre chunks), não duração total, então o worker
   não é morto enquanto há tokens chegando.
+- `GET /llm/version` → **identifica a versão exata do Ollama** interno. Consulta
+  `GET {LLM_URL}/api/version` (endpoint nativo e público do Ollama, que responde
+  `{"version":"0.x.y"}` sem autenticação nem modelo), `GET /api/ps` (modelos
+  carregados na memória) e `POST /api/show` (**metadados do `LLM_MODEL`**: arquitetura,
+  nº de parâmetros, quantização, janela de contexto e tamanho em disco). É leve (~ms),
+  não gera tokens. Devolve um `summary` pronto para leitura (`ollama_version`,
+  `architecture`, `parameter_count_human`, `quantization`, `context_length`,
+  `size_human`) + o detalhe bruto de cada checagem. Se o servidor não expuser algum
+  endpoint, marca `confirmed:false`/campo ausente sem derrubar o app. O chat template
+  nunca é devolvido por inteiro — só o comprimento em caracteres.
 - `GET /env` → mostra a configuração efetiva e **quais** variáveis existem no ambiente,
   **sem expor valores** (política de segurança: nada de credencial em logs). Para URLs
   revela apenas scheme/porta, jamais o hostname interno.
+- `GET /llm/default-think` → descobre o **padrão de thinking** do modelo configurado. Roda
+  o mesmo prompt (`?prompt=`) em três variantes — `omit` (não envia `think`), `off`
+  (`think=false`) e `on` (`think=true`) — e compara se o campo `thinking` aparece. Se a
+  variante `omit` trouxer `thinking`, o default do servidor é **LIGADO**. Devolve um JSON com
+  os três casos (latência, presença de `thinking`, previews) e um `verdict`. Atenção: roda
+  três gerações em série, então chame fora da cascata `/probe`.
+- `GET /llm/openai-compat` → **valida se o Ollama interno expõe a camada compatível com
+  OpenAI** (`/v1/...`). É a checagem que decide se um cliente OpenAI (ex.: o P0) pode falar
+  direto com ele sem ponte de tradução. Roda, em série:
+  1. `GET {LLM_URL}/v1/models` → existe? responde no formato `{"object":"list","data":[...]}`?
+     Confirma apenas se o `LLM_MODEL` configurado aparece na lista (não revela os demais nomes).
+  2. `POST {LLM_URL}/v1/chat/completions` (sync) → gera uma resposta `chat.completion` real?
+  3. `POST {LLM_URL}/v1/chat/completions` (`stream:true`) → emite chunks SSE até `[DONE]`?
+  Devolve `openai_compatible` (true/false), um `verdict` legível e o detalhe de cada teste
+  (status, latência, preview). Aceita `?stream=off` para pular o teste de streaming. Usa o
+  mesmo `Authorization: Bearer` que a biblioteca OpenAI mandaria (placeholder local; nenhum
+  segredo é impresso). Atenção: roda duas gerações em série — chame fora da cascata `/probe`.
+
+## Ordem recomendada para as checagens
+
+Use esta sequência ao diagnosticar um container recém-subido. A regra geral é **barato e
+sem dependência primeiro, caro depois**, parando na primeira falha:
+
+| # | Rota | Endpoint Ollama | Custo | Responde |
+| --- | --- | --- | --- | --- |
+| 1 | `GET /health` | *(nenhum — só env)* | ~0 s | `LLM_URL`/`LLM_MODEL` estão configurados? |
+| 2 | `GET /probe` | `/api/show` + `/api/version` (cascata) | < 1 s por etapa | A **rede** até o LLM está OK (DNS→TCP→TLS→modelo→versão)? |
+| 3 | `GET /llm/version` | `/api/version` → `/api/ps` → `/api/show` | ~ms | Qual a **versão** do servidor e os **metadados** do modelo? |
+| 4 | `GET /warmup` | *(lê estado da thread)* | ~0 s | O cold start já foi pago em background? |
+| 5 | `GET /ready` | `/api/generate` leve ou `/api/show` | 0–2 min | O modelo **respondeu de verdade**? (`200` = pronto) |
+| 6 | `GET /llm/generate-stream` | `/api/generate` (`stream:true`) | segundos–minutos | Geração real token a token (SSE). |
+| 7 | `GET /llm/openai-compat` | `/v1/models` → `/v1/chat/completions` | 2 gerações | Dá para apontar um cliente OpenAI direto? |
+
+Princípios por trás da ordem:
+
+- **Configuração antes de rede**: `/health` não faz HTTP; se `LLM_URL` estiver vazio, as
+  demais rotas só devolvem erro inútil.
+- **Cascata antes de rota individual**: `/probe` já roda DNS→TCP→TLS→modelo→versão e **para
+  na primeira falha**, então identifica *onde* a conexão quebra sem você chamar cada passo.
+- **Leitura antes de inferência**: `/api/version`, `/api/ps` e `/api/show` custam
+  milissegundos e **não geram tokens**; geração síncrona pode levar minutos num modelo
+  thinking. Nunca coloque `generate` dentro de uma cascata com budget.
+- **Prontidão antes de uso**: `/ready` retorna `503` + `retry_after_s` durante o aquecimento
+  — faça polling nele em vez de arriscar um `WORKER TIMEOUT` na primeira pergunta.
+- **As duas rotas caras ficam fora da cascata**: `/llm/default-think` (3 gerações) e
+  `/llm/openai-compat` (2 gerações) — chame-as manualmente, uma por vez.
+
+### Atalho para o caso comum
+
+Se o objetivo é só saber **"o LLM está acessível e qual versão?"**, basta:
+
+```text
+GET /health  →  GET /llm/version
+```
+
+Ambas respondem em menos de um segundo e não dependem do aquecimento terminar.
 
 ### Cascata completa
 
-- `GET /probe` → roda a **cascata de conectividade** (`dns → tcp → tls → model`) em
-  ordem, parando na primeira falha, dentro de um **orçamento de tempo**
+- `GET /probe` → roda a **cascata de conectividade** (`dns → tcp → tls → model → version`)
+  em ordem, parando na primeira falha, dentro de um **orçamento de tempo**
   (`PROBE_BUDGET`). Serve para responder "a rede até o LLM está OK?" num único JSON.
   Cada etapa de rede encurta seu timeout ao restante do budget, então nenhuma requisição
   pendurada consegue estourar o `--timeout` do gunicorn. Quando o budget acaba, as etapas
@@ -116,12 +194,78 @@ modelo), que roda todas as etapas em ordem num único JSON, sem nunca derrubar o
   **Não executa geração**: o passo `generate` sai como `deferred`, pois modelos thinking
   podem levar minutos — para gerar, use `GET /llm/generate-stream` (SSE).
 
+## Estratégia de aquecimento (cold start da primeira chamada)
+
+Medimos que a **primeira geração** após o deploy paga um **cold start de ~105 s**
+(carregar o modelo / sair do sleep), contra ~6 s (thinking) ou ~0,2 s (off) depois de
+quente. O manual também avisa que a LLM só fica disponível **1–2 min após o container
+subir**. Se essa espera acontecesse *dentro* de uma requisição, estouraria o `--timeout`
+do gunicorn (180 s) e derrubaria o worker.
+
+A solução: **esquentar em background no startup**, para o usuário nunca pagar o cold start.
+
+- Ao importar o módulo (startup do worker), `step_warmup()` dispara **uma thread daemon**
+  que roda uma geração mínima (`think=false`, prompt curto) até o modelo responder.
+- A thread **encadeia tentativas** com pausa curta (`WARMUP_INTERVAL`) por um número
+  máximo (`WARMUP_ATTEMPTS`), cobrindo a janela de 1–2 min do manual. Um teto global
+  (`WARMUP_BUDGET`, default 300 s) limita o esforço total: se a LLM estiver morta, o
+  warmup desiste em ~5 min (marca `failed` com "orçamento esgotado") em vez de somar
+  todas as tentativas (~20 min). Só conta como **aquecido** um HTTP 200 **com conteúdo**
+  em `response` — um 200 vazio de cold start é tratado como falha e tenta de novo.
+- `/ready` consulta o estado dessa thread: vira **`200` somente quando o modelo respondeu
+  de fato** (`warm`); enquanto aquece devolve **`503` + `retry_after_s`**; se esgotar as
+  tentativas marca `failed` e cai no teste leve `/api/show`.
+- Como o trabalho pesado vive numa **thread separada**, nenhuma requisição HTTP bloqueia
+  nem mata o worker — a restrição "budget abaixo do `--timeout`" continua valendo para as
+  rotas síncronas, mas o aquecimento em si é assíncrono.
+
+### Variáveis de ambiente do aquecimento
+
+| Variável | Default | Função |
+| --- | --- | --- |
+| `WARMUP_ENABLED` | `1` | `0`/`false` desliga o aquecimento automático. |
+| `WARMUP_PROMPT` | `ping` | Prompt mínimo usado para esquentar. |
+| `WARMUP_TIMEOUT` | `150` | Timeout de leitura de cada tentativa (s). Mantido abaixo do `--timeout`. |
+| `WARMUP_ATTEMPTS` | `8` | Máximo de tentativas antes de marcar `failed`. |
+| `WARMUP_INTERVAL` | `10` | Pausa (s) entre tentativas. |
+| `WARMUP_BUDGET` | `300` | Teto (s) global do esforço total de aquecimento; ao estourar, marca `failed` com "orçamento esgotado" em vez de insistir por ~20 min. |
+
+O aquecimento usa sempre `think=false`: o objetivo é só tirar o modelo do cold start no
+menor tempo possível, não raciocinar. Consulte o progresso em `GET /warmup` ou `GET /env`
+(bloco `warmup`).
+
 ## Modo "thinking" (raciocínio) on/off
 
 Modelos hibridos suportam ligar/desligar o raciocinio pela API
 nativa `/api/generate` com o campo `think` (`true`/`false`); o raciocínio vem no
 campo `thinking` da resposta. Na página `/chat`, basta marcar a caixa
 "pensar antes (thinking)".
+
+### Descoberta: o padrão do modelo é THINKING ON
+
+Medido com `GET /llm/default-think` no modelo institucional, **reprodutível em duas
+execuções independentes** (prompt `"Qual e 2+2? Responda so o numero."`):
+
+| Variante | `think` enviado | Campo `thinking` | Run 1 (frio) | Run 2 (quente) |
+| --- | --- | --- | --- | --- |
+| `omit` | *(ausente)* | ✅ presente | 105.490 ms | 6.986 ms |
+| `off` | `false` | ❌ ausente | 181 ms | 183 ms |
+| `on` | `true` | ✅ presente | 6.008 ms | 5.865 ms |
+
+Conclusões:
+
+- **Omitir `think` liga o raciocínio por padrão** (o caso `omit` sempre traz `thinking`).
+  Ou seja, não dá para confiar no default: se você não enviar `think`, o modelo pensa.
+- **Sempre envie `think` explícito**: `false` para respostas diretas (~0,2 s), `true` (ou a
+  rota SSE `/llm/generate-stream`) quando quiser raciocinar sem matar o worker.
+- O custo de pensar é real: ~6 s (com o modelo quente) contra ~0,2 s no modo direto.
+- **Só a primeira execução é lenta; depois os tempos ficam estáveis.** Os ~105 s do `omit`
+  no run 1 foram **cold-start** (modelo carregando na primeira chamada após o deploy), não o
+  preço fixo do thinking: no run 2 o `omit` caiu para ~7 s, igual ao `on`. Como a rota roda os
+  casos em ordem `omit → off → on`, o `omit` é sempre o primeiro a pagar o aquecimento — por
+  isso o `off` aparece rápido (~0,18 s) nos dois runs, pois já encontrou o modelo quente. Isso
+  reforça o aviso do manual: a LLM leva 1–2 min para ficar pronta e a primeira request paga
+  essa conta.
 
 ## Build local
 

@@ -6,19 +6,24 @@ Testa, por etapas e SEM derrubar o servidor:
   3. TLS   -> handshake com verify=False (cert autogerado, regra do manual)
   4. MODEL -> POST /api/show {"model": LLM_MODEL} (checa so o modelo configurado)
   5. LLM   -> POST /api/generate com LLM_MODEL
+  6. OPENAI-> GET /v1/models + POST /v1/chat/completions (sync e stream SSE),
+     para confirmar se a camada OpenAI-compativel do Ollama esta exposta.
+  7. VERSION-> GET /api/version (e /api/ps) para identificar a VERSAO exata do
+     Ollama que serve a LLM interna.
 
 Cada etapa reporta ok/falha + erro; nenhuma falha impede o app de subir.
 Conforme manual.md: escuta em 0.0.0.0, porta via PORT (padrao 8080),
 processo em primeiro plano, sem VOLUME.
 """
 
+import json
 import os
+import re
 import socket
 import ssl
+import threading
 import time
 from urllib.parse import urlparse
-
-import json
 
 import requests
 from flask import Flask, Response, jsonify, render_template, request as req
@@ -58,32 +63,64 @@ PROBE_BUDGET = float(os.environ.get("PROBE_BUDGET", "55"))
 # uma resposta real pode passar de 120s; 150s fica abaixo do timeout do worker.
 CHAT_BUDGET = float(os.environ.get("CHAT_BUDGET", "150"))
 
+# --- Aquecimento (warmup) da primeira chamada -------------------------------
+# O modelo institucional paga um COLD START na PRIMEIRA geracao: medimos ~105s
+# para carregar/sair do sleep, contra ~6s (thinking) ou ~0,2s (off) depois de
+# quente. O manual tambem avisa que a LLM so fica disponivel 1-2 min apos o
+# container subir. Em vez de fazer o USUARIO esperar isso numa requisicao (que
+# estouraria o --timeout do gunicorn), disparamos UMA geracao minima em
+# BACKGROUND no startup; /ready so vira 200 quando ela realmente responder.
+WARMUP_ENABLED = os.environ.get("WARMUP_ENABLED", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+# Prompt curto; 'think=false' para esquentar o mais rapido possivel (sem raciocinio).
+WARMUP_PROMPT = os.environ.get("WARMUP_PROMPT", "ping")
+# Timeout de LEITURA de cada tentativa de aquecimento. Mantido ABAIXO do
+# --timeout do gunicorn (regra dos budgets): como roda em thread separada nao mata
+# o worker, mas limita quanto tempo uma tentativa pendurada consome.
+WARMUP_TIMEOUT = float(os.environ.get("WARMUP_TIMEOUT", "150"))
+# Quantas tentativas antes de desistir (cobre a janela de 1-2 min do manual).
+WARMUP_ATTEMPTS = int(os.environ.get("WARMUP_ATTEMPTS", "8"))
+# Pausa entre tentativas, em segundos.
+WARMUP_INTERVAL = float(os.environ.get("WARMUP_INTERVAL", "10"))
+# Teto GLOBAL do aquecimento, em segundos. Sem ele, WARMUP_ATTEMPTS x
+# (WARMUP_TIMEOUT + WARMUP_INTERVAL) pode passar de 20 minutos quando a LLM esta
+# simplesmente MORTA - muito mais que a janela de 1-2 min do manual. Ao exceder,
+# a thread para e marca 'failed' com motivo 'budget esgotado'.
+WARMUP_BUDGET = float(os.environ.get("WARMUP_BUDGET", "300"))
+
 _parsed = urlparse(LLM_URL)
 HOST = _parsed.hostname or ""
-PORT = _parsed.port or 443
+# Porta da LLM (vem embutida em LLM_URL). NAO confundir com a variavel de
+# ambiente PORT, que e a porta de ESCUTA desta app (8080). Usar um nome proprio
+# evita que uma referencia futura a PORT pegue silenciosamente a porta da LLM.
+LLM_PORT = _parsed.port or 443
 
 app = Flask(APP_NAME)
 # NUNCA verificar certificado: a LLM usa SSL autogerado (manual.md, secao FAQ).
 requests.packages.urllib3.disable_warnings()
 
 
-# Contexto de deadline do /probe: None nas rotas individuais (usam LLM_TIMEOUT
-# cheio); durante a cascata aponta para o instante-limite da requisicao. Assim
-# TODA etapa de rede (tcp/tls/http/generate/chat) e encurtada ao restante do
-# budget e nenhuma delas consegue pendurar o worker alem do --timeout gunicorn.
-_PROBE_DEADLINE = None
+# Contexto de deadline: None fora de cascata (usa LLM_TIMEOUT cheio); durante uma
+# requisicao com budget aponta para o instante-limite DELA, encurtando toda etapa
+# de rede ao restante do orcamento. thread-local e NAO global de proposito: com o
+# gunicorn servindo varias requests em threads dentro do mesmo worker, um /probe
+# em andamento nao pode ser "resetado" pelo finally de um /api/ask concorrente
+# (o que liberaria a cascata para pendurar alem do --timeout). Cada request ve
+# apenas o proprio deadline.
+_DEADLINE_CTX = threading.local()
 
 
 def _net_timeout(default=None):
     """Devolve a dupla (connect, read) de timeout de rede p/ requests.
 
     connect fica fixo em CONNECT_TIMEOUT (falha rapido se o host nao responde);
-    read segue LLM_TIMEOUT, encurtado ao restante do budget quando o /probe esta
-    em cascata. Rotas de socket puro (tcp/tls) usam _read_timeout() direto."""
+    read segue LLM_TIMEOUT, encurtado ao restante do budget quando a requisicao
+    atual esta em cascata. Rotas de socket puro (tcp/tls) usam _read_timeout()."""
     base = default if default is not None else LLM_TIMEOUT
     read = base
-    if _PROBE_DEADLINE is not None:
-        left = _PROBE_DEADLINE[0] - time.time()
+    deadline = getattr(_DEADLINE_CTX, "deadline", None)
+    if deadline is not None:
+        left = deadline[0] - time.time()
         read = max(0.5, min(base, left))
     return (CONNECT_TIMEOUT, read)
 
@@ -106,18 +143,18 @@ def step_dns():
 def step_tcp():
     t0 = time.time()
     try:
-        with socket.create_connection((HOST, PORT), timeout=_read_timeout()):
-            return {"ok": True, "target": f"{HOST}:{PORT}",
+        with socket.create_connection((HOST, LLM_PORT), timeout=_read_timeout()):
+            return {"ok": True, "target": f"{HOST}:{LLM_PORT}",
                     "ms": round((time.time() - t0) * 1000)}
     except OSError as exc:
-        return {"ok": False, "target": f"{HOST}:{PORT}",
+        return {"ok": False, "target": f"{HOST}:{LLM_PORT}",
                 "error": f"{type(exc).__name__}: {exc}"}
 
 
 def step_tls():
     t0 = time.time()
     try:
-        raw = socket.create_connection((HOST, PORT), timeout=_read_timeout())
+        raw = socket.create_connection((HOST, LLM_PORT), timeout=_read_timeout())
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -201,6 +238,12 @@ def step_generate(prompt="Qual e 2+2? Responda so o numero.", think=None, timeou
         if not resp.ok:
             # Alguns modelos recusam 'think' com 400; guardar o erro bruto.
             out["error_body"] = str(body)[:500]
+        elif not str(body.get("response") or "").strip():
+            # HTTP 200 porem corpo vazio: o modelo respondeu sem conteudo (pode
+            # acontecer durante o cold start). Sem isso, o warmup registraria o
+            # erro como o literal '{}', que nao diagnostica nada.
+            out["reason"] = ("HTTP 200 sem conteudo em 'response' "
+                             f"(chaves retornadas: {sorted(body.keys())})")
         return out
     except requests.RequestException as exc:
         return {"ok": False, "model": LLM_MODEL, "think_sent": think,
@@ -260,6 +303,310 @@ def _sse(data):
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _openai_headers():
+    """Headers p/ os endpoints OpenAI-compat do Ollama.
+
+    A API /v1 do Ollama espera um Authorization Bearer; localmente ela aceita
+    qualquer placeholder (nao valida). NAO ha segredo real aqui - e so o formato
+    que a biblioteca OpenAI manda. LLM_API_KEY (se definida no ambiente) e usada
+    como valor; senao, 'probe'. O valor nunca e impresso nas respostas."""
+    chave = os.environ.get("LLM_API_KEY", "").strip() or "probe"
+    return {"Authorization": f"Bearer {chave}",
+            "Content-Type": "application/json"}
+
+
+def step_openai_models():
+    """GET {LLM_URL}/v1/models - confirma se a camada OpenAI-compat existe.
+
+    Resposta esperada (formato OpenAI): {"object":"list","data":[{"id":...}...]}.
+    Um 404/405 indica que o endpoint /v1 NAO esta exposto nesse host/porta."""
+    url = f"{LLM_URL}/v1/models"
+    t0 = time.time()
+    try:
+        resp = requests.get(url, headers=_openai_headers(),
+                            timeout=_net_timeout(), verify=False)
+        out = {"ok": resp.ok, "status": resp.status_code, "url_path": "/v1/models",
+               "method": "GET", "ms": round((time.time() - t0) * 1000)}
+        if resp.ok:
+            try:
+                body = resp.json()
+                ids = [m.get("id") for m in body.get("data", []) if isinstance(m, dict)]
+                # Formato OpenAI documentado: {"object":"list","data":[...]}. O
+                # probe so marca compat se a resposta bater esse contrato.
+                out["object"] = body.get("object")
+                out["is_list_format"] = body.get("object") == "list"
+                out["model_count"] = len(ids)
+                # So revela se o MODELO configurado aparece; nao lista nomes crus.
+                out["configured_model_present"] = (LLM_MODEL in ids) if LLM_MODEL else None
+            except ValueError:
+                out["error_body"] = resp.text[:300]
+        else:
+            out["error_body"] = resp.text[:300]
+        return out
+    except requests.RequestException as exc:
+        return {"ok": False, "url_path": "/v1/models", "method": "GET",
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
+def step_openai_chat(stream=False):
+    """POST {LLM_URL}/v1/chat/completions - geracao real via API OpenAI.
+
+    Manda uma pergunta trivial no formato da biblioteca OpenAI (messages) e
+    confere se o Ollama responde em chat.completion (sync) ou em chunks SSE
+    (stream). E o teste definitivo de que o P0 consegue falar direto com ele."""
+    url = f"{LLM_URL}/v1/chat/completions"
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [{"role": "user",
+                      "content": "Qual e 2+2? Responda so o numero."}],
+        "stream": bool(stream),
+    }
+    t0 = time.time()
+    try:
+        with requests.post(url, json=payload, headers=_openai_headers(),
+                           stream=bool(stream), timeout=_net_timeout(),
+                           verify=False) as resp:
+            out = {"ok": resp.ok, "status": resp.status_code,
+                   "url_path": "/v1/chat/completions", "method": "POST",
+                   "stream": bool(stream),
+                   "ms": round((time.time() - t0) * 1000)}
+            if not resp.ok:
+                out["error_body"] = resp.text[:300]
+                return out
+            if not stream:
+                try:
+                    body = resp.json()
+                    choice = (body.get("choices") or [{}])[0]
+                    msg = choice.get("message") or {}
+                    out["object"] = body.get("object")
+                    # Sync deve vir como "chat.completion" (docs OpenAI/Ollama).
+                    out["is_completion_object"] = body.get("object") == "chat.completion"
+                    out["response_preview"] = str(msg.get("content", ""))[:200]
+                    out["finish_reason"] = choice.get("finish_reason")
+                    out["has_usage"] = isinstance(body.get("usage"), dict)
+                    # reasoning_content = thinking exposto pela camada OpenAI.
+                    out["has_reasoning_field"] = "reasoning_content" in msg
+                except ValueError:
+                    out["error_body"] = resp.text[:300]
+                return out
+            # streaming: conta chunks ate o [DONE], guarda amostra do primeiro.
+            eventos = 0
+            texto = ""
+            done = False
+            chunk_object = None
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw:
+                    continue
+                if not raw.startswith("data:"):
+                    continue
+                dado = raw[len("data:"):].strip()
+                if dado == "[DONE]":
+                    done = True
+                    break
+                try:
+                    obj = json.loads(dado)
+                except ValueError:
+                    continue
+                if chunk_object is None:
+                    chunk_object = obj.get("object")
+                delta = ((obj.get("choices") or [{}])[0]).get("delta") or {}
+                conteudo = delta.get("content")
+                if conteudo:
+                    eventos += 1
+                    if len(texto) < 200:
+                        texto += conteudo
+            out.update({"chunk_events": eventos,
+                        "chunk_object": chunk_object,
+                        "got_done": done,
+                        "response_preview": texto[:200],
+                        # Streaming correto emite chunks "chat.completion.chunk".
+                        "streaming_ok": (eventos > 0 and done
+                                         and chunk_object == "chat.completion.chunk")})
+            return out
+    except requests.RequestException as exc:
+        return {"ok": False, "url_path": "/v1/chat/completions", "method": "POST",
+                "stream": bool(stream), "error": f"{type(exc).__name__}: {exc}"}
+
+
+def step_version():
+    """Descobre a VERSAO do Ollama via GET {LLM_URL}/api/version.
+
+    Endpoint nativo e publico do Ollama (documentado): responde
+    {"version":"0.x.y"} sem autenticacao nem modelo. E a forma definitiva de
+    saber qual build do servidor esta atras do hostname interno. Como fallback
+    complementar, chama GET /api/ps (modelos carregados na memoria); um erro de
+    conexao ai confirma que a porta nao responde, mas NUNCA derruba o app.
+    Nao executa nada no alvo: so leitura HTTP."""
+    url = f"{LLM_URL}/api/version"
+    t0 = time.time()
+    out = {"ok": False, "url_path": "/api/version", "method": "GET",
+           "ms": None}
+    try:
+        resp = requests.get(url, timeout=_net_timeout(20), verify=False)
+        out["status"] = resp.status_code
+        out["ms"] = round((time.time() - t0) * 1000)
+        if resp.ok:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+                out["error_body"] = resp.text[:300]
+            # Formato documentado do Ollama: {"version": "0.x.y"}.
+            versao = body.get("version")
+            out["version"] = versao
+            out["ok"] = bool(versao)
+            if not versao and not out.get("error_body"):
+                out["error_body"] = str(body)[:300]
+        else:
+            out["error_body"] = resp.text[:300]
+    except requests.RequestException as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        out["ms"] = round((time.time() - t0) * 1000)
+    return out
+
+
+def step_ps():
+    """Complemento leve: GET {LLM_URL}/api/ps lista modelos QUENTE na memoria.
+
+    Nao revela a versao por si, mas corrobora o /api/version e mostra o estado
+    de carga do modelo (nome, tamanho, expira). Best-effort: falha aqui nao
+    invalida a descoberta de versao."""
+    url = f"{LLM_URL}/api/ps"
+    t0 = time.time()
+    out = {"ok": False, "url_path": "/api/ps", "method": "GET"}
+    try:
+        resp = requests.get(url, timeout=_net_timeout(20), verify=False)
+        out["status"] = resp.status_code
+        out["ms"] = round((time.time() - t0) * 1000)
+        if resp.ok:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+            models = body.get("models") or []
+            out["loaded_count"] = len(models)
+            # So nomes/tamanhos; sem campos sensiveis.
+            out["loaded"] = [{"name": m.get("name"),
+                              "size_vram": m.get("size")} for m in models[:10]]
+            out["ok"] = True
+        else:
+            out["error_body"] = resp.text[:200]
+    except requests.RequestException as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def _human_bytes(n):
+    """Formata bytes em sufixo binario legivel (B/KiB/MiB/GiB/TiB)."""
+    if not isinstance(n, (int, float)) or n < 0:
+        return None
+    val = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if val < 1024 or unit == "TiB":
+            return f"{val:.1f} {unit}" if unit != "B" else f"{int(val)} B"
+        val /= 1024
+    return None
+
+
+def _human_params(n):
+    """Formata contagem de parametros em milhoes/bilhoes (ex.: '9.0B')."""
+    if not isinstance(n, (int, float)) or n <= 0:
+        return None
+    if n >= 1e9:
+        return f"{n / 1e9:.1f}B"
+    if n >= 1e6:
+        return f"{n / 1e6:.1f}M"
+    return str(int(n))
+
+
+def step_show():
+    """Metadados do MODELO configurado via POST {LLM_URL}/api/show.
+
+    Enriquece a descoberta de versao: alem do build do servidor (/api/version),
+    revela o que o modelo realmente e - arquitetura, numero de parametros,
+    quantizacao, janela de contexto e tamanho em disco. O payload do Ollama traz:
+      model_info {family, families, general.architecture, general.parameter_count,
+                  general.quantization_version, ...}
+      parameters (string GGUF 'key = value', ex.: context_length 4096)
+      template   (chat template) -> so reportamos o comprimento, nunca o corpo
+      size       (bytes do blob)
+    Best-effort: sem LLM_MODEL faz skipped; falha nao derruba o app nem a rota."""
+    if not LLM_MODEL:
+        return {"ok": False, "skipped": True,
+                "reason": "LLM_MODEL nao definido - nada para descrever"}
+    url = f"{LLM_URL}/api/show"
+    t0 = time.time()
+    out = {"ok": False, "url_path": "/api/show", "method": "POST",
+           "model": LLM_MODEL}
+    try:
+        resp = requests.post(url, json={"model": LLM_MODEL},
+                             timeout=_net_timeout(20), verify=False)
+        out["status"] = resp.status_code
+        out["ms"] = round((time.time() - t0) * 1000)
+        if not resp.ok:
+            out["error_body"] = resp.text[:300]
+            return out
+        try:
+            body = resp.json()
+        except ValueError:
+            out["error_body"] = resp.text[:300]
+            return out
+        info = body.get("model_info") or {}
+        # O dicionario do Ollama usa chaves pontuadas literais: a arquitectura vem
+        # em "general.architecture" (nao em "architecture"). As metricas especificas
+        # ficam prefixadas pelo nome da arquitectura (ex.: "qwen2.context_length").
+        architecture = info.get("general.architecture")
+        # Contagem de parametros: o Ollama pode expor como numero bruto em
+        # "<arch>.parameter_count" OU "general.parameter_count", e quase sempre
+        # tambem traz um rotulo legivel em details.parameter_size ("9B").
+        param_count = None
+        if architecture:
+            param_count = info.get(f"{architecture}.parameter_count")
+        if param_count is None:
+            param_count = info.get("general.parameter_count")
+        # Quantizacao: preferir SEMPRE um rotulo legivel ("Q4_K_M"): primeiro o
+        # especifico da arquitectura (<arch>.quantization_level), depois o campo
+        # amigavel de details.quantization_level. So recorrer ao numero interno
+        # general.quantization_version se nenhum rotulo existir.
+        details = body.get("details") or {}
+        quant = None
+        if architecture:
+            quant = info.get(f"{architecture}.quantization_level")
+        if quant is None:
+            quant = details.get("quantization_level")
+        if quant is None:
+            quant = info.get("general.quantization_version")
+        families = info.get("general.families") or details.get("families")
+        # A janela de contexto pode estar no dicionario de arquitectura OU na
+        # string 'parameters' (GGUF). Extrai context_length de ambos.
+        ctx = info.get(f"{architecture}.context_length") if architecture else None
+        params_str = str(body.get("parameters") or "")
+        if ctx is None:
+            m = re.search(r"context_length\s*=\s*(\d+)", params_str)
+            if m:
+                ctx = int(m.group(1))
+        out.update({
+            "ok": True,
+            "architecture": architecture,
+            "families": families,
+            "parameter_count": param_count,
+            "parameter_count_human": _human_params(param_count)
+                or details.get("parameter_size"),
+            "quantization": quant,
+            "context_length": ctx,
+            "size_bytes": body.get("size"),
+            "size_human": _human_bytes(body.get("size")),
+            "details": details,
+            # NAO devolve o template inteiro (pode ser grande); so o comprimento.
+            "template_chars": len(str(body.get("template") or "")),
+        })
+        return out
+    except requests.RequestException as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        out["ms"] = round((time.time() - t0) * 1000)
+        return out
+
+
 def step_env():
     """Configuracao efetiva da app + presenca das variaveis relevantes.
     Nao expoe valores de variaveis (manual: sem credenciais em logs); mostra
@@ -277,18 +624,26 @@ def step_env():
         return info
 
     keys = ["LLM_URL", "LLM_MODEL", "LLM_TIMEOUT", "CONNECT_TIMEOUT",
-            "PROBE_BUDGET", "CHAT_BUDGET", "PORT", "PROBE_PROMPT"]
+            "PROBE_BUDGET", "CHAT_BUDGET", "PORT", "PROBE_PROMPT",
+            "LLM_API_KEY",
+            "WARMUP_ENABLED", "WARMUP_PROMPT", "WARMUP_TIMEOUT",
+            "WARMUP_ATTEMPTS", "WARMUP_INTERVAL", "WARMUP_BUDGET"]
     return {
         "ok": True,
         "app": APP_NAME,
         "llm_url_scheme": _parsed.scheme,
-        "llm_url_port": PORT,
+        "llm_url_port": LLM_PORT,
         "llm_model_set": bool(LLM_MODEL),
         "llm_timeout_s": LLM_TIMEOUT,
         "connect_timeout_s": CONNECT_TIMEOUT,
         "probe_budget_s": PROBE_BUDGET,
         "chat_budget_s": CHAT_BUDGET,
         "gunicorn_timeout_s": GUNICORN_TIMEOUT,
+        "warmup": {
+            "enabled": WARMUP_ENABLED,
+            "status": _estado_warmup().get("status"),
+            "attempts": _estado_warmup().get("attempts"),
+        },
         "constraint": "todos os budgets devem ficar ABAIXO do gunicorn --timeout",
         "vars": {k: present(k) for k in keys},
         "count_total_env": len(os.environ),
@@ -297,27 +652,157 @@ def step_env():
     }
 
 
+# --------------------------------------------------------------------------
+# Aquecimento (warmup): paga o cold start da PRIMEIRA geracao em background.
+# Estado compartilhado entre a thread de aquecimento e a rota /ready.
+# --------------------------------------------------------------------------
+_WARMUP_LOCK = threading.Lock()
+_WARMUP_STATE = {
+    # status: 'pending' | 'warming' | 'warm' | 'failed' | 'disabled' | 'skipped'
+    "status": "pending",
+    "attempts": 0,
+    "started_at": None,
+    "finished_at": None,
+    "duration_ms": None,
+    "error": None,
+}
+
+
+def _marcar_warmup(**campos):
+    """Atualiza o estado de aquecimento sob lock (unico ponto de escrita)."""
+    with _WARMUP_LOCK:
+        _WARMUP_STATE.update(campos)
+
+
+def _rodar_warmup():
+    """Corpo da thread: tenta uma geracao minima ate o modelo responder.
+
+    Roda fora de qualquer requisicao HTTP, entao o cold start (~105s) e a janela
+    de 1-2 min do manual NUNCA estouram o --timeout do gunicorn nem fazem o
+    usuario esperar. Usa think=false para esquentar no menor tempo possivel.
+    Encadeia tentativas com pausa curta; sucesso marca 'warm', exauridas marca
+    'failed'. Um teto global (WARMUP_BUDGET) limita o esforco total: se a LLM
+    estiver morta, desiste em minutos em vez de ~20. Sucesso real exige conteudo
+    em 'response' - um HTTP 200 vazio de cold start nao conta como aquecido."""
+    _marcar_warmup(status="warming", started_at=time.time(), attempts=0,
+                   error=None, duration_ms=None, finished_at=None)
+    t_inicio = time.time()
+    ultimo_erro = None
+    for tentativa in range(1, max(1, WARMUP_ATTEMPTS) + 1):
+        # Teto global: nao adianta insistir por 20 minutos numa LLM indisponivel.
+        if time.time() - t_inicio >= WARMUP_BUDGET:
+            _marcar_warmup(
+                status="failed", finished_at=time.time(),
+                error=(f"orcamento de aquecimento esgotado "
+                       f"({WARMUP_BUDGET:.0f}s, {tentativa - 1} tentativa(s)); "
+                       f"ultima falha: {str(ultimo_erro)[:160]}"))
+            return
+        _marcar_warmup(attempts=tentativa)
+        res = step_generate(prompt=WARMUP_PROMPT, think=False,
+                            timeout=(CONNECT_TIMEOUT, WARMUP_TIMEOUT))
+        if res.get("ok") and str(res.get("response") or "").strip():
+            _marcar_warmup(
+                status="warm",
+                finished_at=time.time(),
+                duration_ms=round((time.time() - _WARMUP_STATE["started_at"]) * 1000),
+                error=None,
+            )
+            return
+        ultimo_erro = (res.get("error") or res.get("reason")
+                       or res.get("error_body") or f"HTTP {res.get('status')}")
+        _marcar_warmup(error=str(ultimo_erro)[:300])
+        if tentativa < WARMUP_ATTEMPTS:
+            # Pausa nunca ultrapassa o orcamento restante: se so faltam 3s,
+            # dorme 3s e a proxima iteracao encerra o loop por budget.
+            restante = WARMUP_BUDGET - (time.time() - t_inicio)
+            if restante <= 0:
+                continue
+            time.sleep(min(WARMUP_INTERVAL, restante))
+    _marcar_warmup(status="failed", finished_at=time.time())
+
+
+def step_warmup():
+    """Dispara o aquecimento em background UMA vez (idempotente).
+
+    Chamado no startup do worker. Sem LLM_MODEL nao ha o que esquentar ('skipped');
+    desabilitado por env, 'disabled'. A thread e daemon: morre junto com o processo
+    e nunca bloqueia o shutdown."""
+    if not WARMUP_ENABLED:
+        _marcar_warmup(status="disabled")
+        return {"started": False, "status": "disabled"}
+    if not LLM_MODEL:
+        _marcar_warmup(status="skipped", error="LLM_MODEL nao definido")
+        return {"started": False, "status": "skipped"}
+    with _WARMUP_LOCK:
+        ja_em_andamento = _WARMUP_STATE["status"] in ("warming", "warm")
+    if ja_em_andamento:
+        return {"started": False, "status": _WARMUP_STATE["status"]}
+    threading.Thread(target=_rodar_warmup, name="warmup", daemon=True).start()
+    return {"started": True, "status": "warming"}
+
+
+def _estado_warmup():
+    with _WARMUP_LOCK:
+        return dict(_WARMUP_STATE)
+
+
 def step_ready():
-    """Health de PRONTIDAO: responde pronto apenas quando o MODELO configurado
-    esta de pe. Atende o aviso do manual ('LLM disponivel 1-2 min apos iniciar').
-    Faz um GET /api/show barato em LLM_MODEL (sem gerar texto e sem listar os
-    outros modelos) e usa codigo HTTP 503 enquanto nao estiver pronto, para
-    permitir polling automatizado."""
+    """Health de PRONTIDAO REAL: so 200 quando o modelo respondeu de fato.
+
+    Diferenca-chave vs. um mero /api/show: 'show' confirma que o MODELO existe, mas
+    quem paga o cold start (~105s) e a primeira GERACAO. Entao /ready consulta o
+    estado do aquecimento em background: 'warm' -> 200; 'warming'/'pending' -> 503
+    com retry_after (polling); 'failed'/'skipped'/'disabled' -> cai no teste leve de
+    /api/show para dar um veredito honesto. Nunca bloqueia a requisicao esperando o
+    generate: a espera acontece na thread, nao aqui."""
+    estado = _estado_warmup()
+    status = estado.get("status")
+    base = {
+        "model_checked": LLM_MODEL or None,
+        "warmup_status": status,
+        "warmup_attempts": estado.get("attempts"),
+    }
+
+    if status == "warm":
+        base.update({
+            "ready": True,
+            "llm_reachable": True,
+            "warmup_duration_ms": estado.get("duration_ms"),
+        })
+        return base, 200
+
+    if status in ("warming", "pending"):
+        base.update({
+            "ready": False,
+            "llm_reachable": False,
+            "retry_after_s": int(max(2, WARMUP_INTERVAL)),
+            "hint": ("Aquecendo o modelo (cold start ~105s; LLM pode levar 1-2 min "
+                     "apos o container subir - manual.md). Polling ate virar 200."),
+        })
+        if status == "warming":
+            base["elapsed_ms"] = round(
+                (time.time() - (estado.get("started_at") or time.time())) * 1000)
+        return base, 503
+
+    # 'failed' | 'skipped' | 'disabled': sem aquecimento ativo, faz o teste leve.
     model = step_model()
     ready = bool(model.get("ok"))
-    body = {
+    base.update({
         "ready": ready,
         "llm_reachable": ready,
-        "model_checked": LLM_MODEL or None,
         "status": model.get("status"),
         "ms": model.get("ms"),
-    }
-    if model.get("skipped"):
-        body["hint"] = model.get("reason", "LLM_MODEL nao definido")
+    })
+    if status == "failed":
+        base["hint"] = (f"Aquecimento falhou apos {base.get('warmup_attempts')} "
+                        f"tentativa(s): {estado.get('error')}. O teste /api/show "
+                        "acima ainda indica se o modelo existe.")
+    elif model.get("skipped"):
+        base["hint"] = model.get("reason", "LLM_MODEL nao definido")
     elif not ready:
-        body["hint"] = ("LLM pode levar 1-2 min apos o inicio do container "
+        base["hint"] = ("LLM pode levar 1-2 min apos o inicio do container "
                         "(manual.md). Aguarde e tente de novo.")
-    return body, (200 if ready else 503)
+    return base, (200 if ready else 503)
 
 
 @app.get("/")
@@ -327,6 +812,9 @@ def home():
         "<b>estado:</b> /health /ready /env<br>"
         "<b>LLM:</b> /probe (cascata dns-tcp-tls-model) "
         "/llm/generate-stream?prompt=... (SSE p/ thinking)<br>"
+        "<b>OpenAI-compat:</b> /llm/openai-compat (testa /v1/models e "
+        "/v1/chat/completions)<br>"
+        "<b>Versao:</b> /llm/version (identifica a versao do Ollama)<br>"
         '<a href="/chat">Ir para a pagina de perguntas (chat)</a>'
     )
 
@@ -352,13 +840,12 @@ def api_ask():
     think = True if data.get("think") else False
     # Orçamento de tempo proprio: limita a chamada ao restante de CHAT_BUDGET,
     # evitando WORKER TIMEOUT quando o modelo esta frio/lento.
-    global _PROBE_DEADLINE
     t0 = time.time()
-    _PROBE_DEADLINE = [t0 + CHAT_BUDGET]
+    _DEADLINE_CTX.deadline = [t0 + CHAT_BUDGET]
     try:
         result = step_generate(prompt=prompt, think=think)
     finally:
-        _PROBE_DEADLINE = None
+        _DEADLINE_CTX.deadline = None
     result["_budget"] = {
         "budget_s": CHAT_BUDGET,
         "elapsed_ms": round((time.time() - t0) * 1000),
@@ -383,13 +870,12 @@ def probe_all():
     restantes saem 'skipped'. NAO executa geracao (modelos thinking podem levar
     minutos): o passo 'generate' sai 'deferred' e a geracao vive em
     /llm/generate-stream."""
-    global _PROBE_DEADLINE
     t_start = time.time()
     out = {}
-    _PROBE_DEADLINE = [t_start + PROBE_BUDGET]
+    _DEADLINE_CTX.deadline = [t_start + PROBE_BUDGET]
 
     def remaining():
-        return _PROBE_DEADLINE[0] - time.time()
+        return _DEADLINE_CTX.deadline[0] - time.time()
 
     def run(name, fn, kwargs=None):
         # Sem budget: registra skipped em vez de executar (evita matar worker).
@@ -407,6 +893,8 @@ def probe_all():
             run("tcp", step_tcp)
             run("tls", step_tls)
             run("model", step_model)
+            # Versao do servidor: leitura barata, entra na cascata apos o modelo.
+            run("version", step_version)
             # Geracao fica fora da cascata (ver docstring); so marca deferred.
             out["generate"] = {
                 "ok": None,
@@ -420,7 +908,7 @@ def probe_all():
             "remaining_ms": round(remaining() * 1000),
         }
     finally:
-        _PROBE_DEADLINE = None
+        _DEADLINE_CTX.deadline = None
     return jsonify(out)
 
 
@@ -442,10 +930,156 @@ def probe_env():
     return jsonify(step_env())
 
 
+@app.get("/llm/version")
+def llm_version():
+    """Identifica a VERSAO do Ollama interno (GET /api/version) + modelos quentes
+    (/api/ps) + metadados do MODELO configurado (POST /api/show: arquitetura,
+    parametros, quantizacao, contexto, tamanho). Leve e rapido (~ms); nao gera
+    tokens. Uso: /llm/version"""
+    if not LLM_URL:
+        return jsonify(ok=False,
+                       reason="LLM_URL nao definido - nada para consultar"), 503
+    ver = step_version()
+    ps = step_ps()
+    show = step_show()
+    info = {
+        "ollama_version": ver.get("version"),
+        "confirmed": bool(ver.get("ok")),
+        "model": LLM_MODEL or None,
+        "architecture": show.get("architecture"),
+        "parameter_count_human": show.get("parameter_count_human"),
+        "quantization": show.get("quantization"),
+        "context_length": show.get("context_length"),
+        "size_human": show.get("size_human"),
+    }
+    return jsonify({
+        "summary": info,
+        "ollama_version": ver.get("version"),
+        "confirmed": bool(ver.get("ok")),
+        "version_check": ver,
+        "process_check": ps,
+        "model_check": show,
+    })
+
+
+@app.get("/llm/default-think")
+def llm_default_think():
+    """Descobre o PADRAO de thinking do modelo configurado (LLM_MODEL).
+
+    Roda o mesmo prompt em tres variantes e compara:
+      - omit : NAO envia 'think'  -> revela o default real do modelo/servidor
+      - off  : envia think=false
+      - on   : envia think=true
+    Se 'omit' trouxer campo 'thinking' preenchido, o padrao do modelo e LIGADO;
+    se vier ausente/vazio, o padrao e DESLIGADO. Uso: /llm/default-think?prompt=...
+    """
+    prompt = req.args.get(
+        "prompt", "Qual e 2+2? Responda so o numero.")
+    cases = {"omit": None, "off": False, "on": True}
+    results = {}
+    for name, think in cases.items():
+        res = step_generate(prompt=prompt, think=think)
+        results[name] = {
+            "think_sent": res.get("think_sent"),
+            "ok": res.get("ok"),
+            "status": res.get("status"),
+            "has_thinking_field": bool(res.get("thinking")),
+            "thinking_preview": str(res.get("thinking") or "")[:200],
+            "response_preview": str(res.get("response") or "")[:200],
+            "ms": res.get("ms"),
+            "error": res.get("error") or res.get("reason") or res.get("error_body"),
+        }
+    # Conclusao heuristica baseada apenas no caso 'omit' (o default real).
+    om = results["omit"]
+    if not om.get("ok"):
+        verdict = "inconclusive (chamada sem 'think' falhou)"
+    elif om.get("has_thinking_field"):
+        verdict = "padrao do modelo = THINKING ON (veio campo thinking sem enviar think)"
+    else:
+        verdict = "padrao do modelo = THINKING OFF (sem campo thinking quando 'think' omitido)"
+    return jsonify({"model": LLM_MODEL, "prompt": prompt,
+                    "verdict": verdict, "cases": results})
+
+
+@app.get("/llm/openai-compat")
+def llm_openai_compat():
+    """Testa se o Ollama interno expoe a camada OpenAI-compativel (/v1/...).
+
+    Se funcionar, um cliente OpenAI (ex.: o P0) pode apontar direto para ele sem
+    nenhuma ponte de traducao - so falta resolver o ALCANCE de rede. Roda:
+      1. GET  /v1/models            -> existe? lista modelos no formato OpenAI?
+      2. POST /v1/chat/completions  sync   -> gera resposta chat.completion?
+      3. POST /v1/chat/completions  stream -> emite chunks SSE ate [DONE]?
+    Uso: /llm/openai-compat?stream=off (para pular o teste de streaming)."""
+    if not LLM_URL or not LLM_MODEL:
+        return jsonify(ok=False,
+                       reason="LLM_URL/LLM_MODEL nao definidos - nada para testar"), 503
+    version = step_version()
+    with_models = step_openai_models()
+    sync_chat = step_openai_chat(stream=False)
+    quer_stream = _parse_think(req.args.get("stream")) is not False  # default on
+    stream_chat = step_openai_chat(stream=True) if quer_stream else {"skipped": True}
+
+    compat = bool(with_models.get("ok")) and bool(sync_chat.get("ok"))
+    if compat:
+        partes = ["GET /v1/models OK", "POST /v1/chat/completions (sync) OK"]
+        if quer_stream and stream_chat.get("streaming_ok"):
+            partes.append("streaming SSE OK")
+        elif stream_chat.get("skipped"):
+            partes.append("streaming NAO testado (?stream=off)")
+        else:
+            partes.append("streaming FALHOU (sync ainda funciona)")
+        verdict = "COMPATIVEL com OpenAI: " + "; ".join(partes)
+    else:
+        falhas = []
+        if not with_models.get("ok"):
+            falhas.append(f"/v1/models -> {with_models.get('status') or with_models.get('error')}")
+        if not sync_chat.get("ok"):
+            falhas.append(f"/v1/chat/completions -> {sync_chat.get('status') or sync_chat.get('error')}")
+        verdict = ("NAO confirmado como OpenAI-compat: " + "; ".join(falhas)
+                   + ". Use a API nativa /api/generate.")
+    return jsonify({
+        "model": LLM_MODEL,
+        "ollama_version": version.get("version"),
+        "openai_compatible": compat,
+        "verdict": verdict,
+        "version": version,
+        "models": with_models,
+        "chat_sync": sync_chat,
+        "chat_stream": stream_chat,
+    })
+
+
 @app.get("/ready")
 def probe_ready():
     body, code = step_ready()
-    return jsonify(body), code
+    headers = {} if body.get("ready") else {"Retry-After": str(int(max(2, WARMUP_INTERVAL)))}
+    return jsonify(body), code, headers
+
+
+@app.get("/warmup")
+def probe_warmup():
+    """Mostra o estado do aquecimento e, se preciso, (re)dispara em background.
+    Responde imediato - nunca espera o generate terminar."""
+    disparo = step_warmup()
+    estado = _estado_warmup()
+    return jsonify({
+        "config": {
+            "enabled": WARMUP_ENABLED,
+            "prompt": WARMUP_PROMPT,
+            "think_sent": False,
+            "timeout_s": WARMUP_TIMEOUT,
+            "attempts": WARMUP_ATTEMPTS,
+            "interval_s": WARMUP_INTERVAL,
+        },
+        "trigger": disparo,
+        "state": estado,
+    })
+
+
+# No import do modulo (startup do worker gunicorn / python app.py), ja dispara o
+# aquecimento em background para o cold start rodar enquanto ninguem espera.
+step_warmup()
 
 
 if __name__ == "__main__":
