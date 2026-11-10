@@ -1,10 +1,12 @@
+# ambiente virtual local (nao vai para o build context)
+.venv/
+venv/
+env/
+
 __pycache__/
 *.pyc
 *.pyo
-# imagem/tar de build em qualquer nivel (ex.: probe-llm.tar)
+
+# artefatos de build/export em qualquer nivel (ex.: probe-llm.tar)
 *.tar
 **/*.tar
-manual.md
-# dump de rede do navegador (contem IP/endpoint interno da LLM - nao vai para a imagem)
-download/
-**/download/
