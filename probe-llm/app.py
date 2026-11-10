@@ -144,6 +144,22 @@ def _read_timeout(default=None):
     return _net_timeout(default)[1]
 
 
+def _endpoint_mask():
+    """Endpoint do LLM sem o hostname interno.
+
+    O repo de entrega e PUBLICO (manual/convencao do P0) e as paginas HTML,
+    /health e /probe sao servidos a qualquer visitante. Para nao publicar o
+    hostname institucional, mostra apenas host mascarado + porta, ex.:
+      https://host-interno.exemplo:9001  ->  https://***:9001
+    A URL completa continua viva apenas em memoria (LLM_URL), usada para as
+    chamadas reais - nunca em resposta HTTP.
+    """
+    if not LLM_URL:
+        return "(LLM_URL nao definido)"
+    port = LLM_PORT
+    return f"{_parsed.scheme or 'http'}://***:{port}"
+
+
 def step_dns():
     t0 = time.time()
     try:
@@ -151,17 +167,22 @@ def step_dns():
         ips = sorted({i[4][0] for i in infos})
         return {"ok": True, "ips": ips, "ms": round((time.time() - t0) * 1000)}
     except OSError as exc:
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        # str(gaierror) traz o hostname pedido ("[Errno -3] Temporary failure
+        # in name resolution" e variantes com host). Como /probe e pagina para
+        # visitante de repo PUBLICO, so mostra a classe do erro + endpoint
+        # mascarado; o hostname fica apenas no log interno do container.
+        app.logger.debug("dns fail %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__} em {_endpoint_mask()}"}
 
 
 def step_tcp():
     t0 = time.time()
     try:
         with socket.create_connection((HOST, LLM_PORT), timeout=_read_timeout()):
-            return {"ok": True, "target": f"{HOST}:{LLM_PORT}",
+            return {"ok": True, "target": f"***:{LLM_PORT}",
                     "ms": round((time.time() - t0) * 1000)}
     except OSError as exc:
-        return {"ok": False, "target": f"{HOST}:{LLM_PORT}",
+        return {"ok": False, "target": f"***:{LLM_PORT}",
                 "error": f"{type(exc).__name__}: {exc}"}
 
 
@@ -196,7 +217,7 @@ def step_model():
     try:
         resp = requests.post(url, json={"model": LLM_MODEL},
                              timeout=_net_timeout(), verify=False)
-        out = {"ok": resp.ok, "status": resp.status_code, "url": url,
+        out = {"ok": resp.ok, "status": resp.status_code, "url": _endpoint_mask() + "/api/show",
                "method": "POST", "checked_model": LLM_MODEL,
                "ms": round((time.time() - t0) * 1000)}
         if not resp.ok:
@@ -204,7 +225,7 @@ def step_model():
             out["error_body"] = resp.text[:300]
         return out
     except requests.RequestException as exc:
-        return {"ok": False, "url": url, "method": "POST",
+        return {"ok": False, "url": _endpoint_mask() + "/api/show", "method": "POST",
                 "checked_model": LLM_MODEL,
                 "error": f"{type(exc).__name__}: {exc}"}
 
@@ -495,7 +516,14 @@ def _normalize_keep_alive(raw):
 
 
 def _split_csv(raw, default=None):
-    """Divide 'a,b,c' em lista de strings limpas; usa default se vazio/None."""
+    """Divide 'a,b,c' em lista de strings limpas; usa default se vazio/None.
+
+    Aceita tambem lista ja decodificada (corpo JSON de POST /sweep), evitando o
+    str(list) que viraria um item unico tipo "['-1']"."""
+    if isinstance(raw, (list, tuple)):
+        parts = [str(p).strip() for p in raw]
+        parts = [p for p in parts if p != ""]
+        return parts or list(default or [])
     if not raw:
         return list(default or [])
     parts = [p.strip() for p in str(raw).split(",")]
@@ -1279,7 +1307,7 @@ def home():
         "<link rel='stylesheet' href='/static/perf.css'></head><body>"
         "<h1>&#9635; probe-llm</h1>"
         "<div class='sub'>diagnóstico do LLM institucional &middot; "
-        f"LLM_URL <code>{LLM_URL or '(nao definido)'}</code> &middot; modelo "
+        f"LLM_URL <code>{_endpoint_mask()}</code> &middot; modelo "
         f"{LLM_MODEL or '(nao definido)'} "
         "&middot; <a href='/perf'>monitor</a> &middot; <a href='/chat'>chat</a></div>"
         "<dl class='kv'>"
@@ -1303,7 +1331,7 @@ def home():
 @app.get("/chat")
 def chat_page():
     model = LLM_MODEL or "(LLM_MODEL nao definido - configure no dashboard)"
-    return render_template("chat.html", model=model, url=LLM_URL)
+    return render_template("chat.html", model=model, url=_endpoint_mask())
 
 
 @app.post("/api/ask")
@@ -1334,7 +1362,7 @@ def api_ask():
 def health():
     return jsonify(status="ok", app=APP_NAME,
                    port=int(os.environ.get("PORT", 8080)),
-                   llm_url=LLM_URL, llm_model_set=bool(LLM_MODEL))
+                   llm_url=_endpoint_mask(), llm_model_set=bool(LLM_MODEL))
 
 
 @app.get("/probe")
@@ -1402,7 +1430,7 @@ def probe_generate_stream():
                              "X-Accel-Buffering": "no"})
 
 
-@app.get("/bench")
+@app.route("/bench", methods=["GET", "POST"])
 def bench():
     """Benchmark sequencial: N geracoes iguais -> TTFT, tokens/s, p50/p95.
 
@@ -1416,24 +1444,40 @@ def bench():
       think    : on|off (omitido = nao envia o campo)
       num_ctx  : janela de contexto (vai em options.num_ctx)
       keep_alive: permanencia na VRAM ('30s', '-1', '0')
-    Uso: /bench?runs=3&num_ctx=4096&keep_alive=-1&think=off"""
+    Uso: /bench?runs=3&num_ctx=4096&keep_alive=-1&think=off
+
+    POST com JSON (mesmos campos no corpo): use quando o prompt e longo demais
+    para URL -- gateways como o App Service limitam a request line a ~4 KB e
+    respondem 400 'Request Line is too large' antes de chegar ao Flask.
+    Uso: curl -X POST /bench -H 'Content-Type: application/json' \
+         -d '{"prompt":"...","runs":1,"num_ctx":2048,"think":"off"}'
+    Query string ainda tem prioridade quando presente."""
     if not LLM_MODEL:
         return jsonify(ok=False,
                        reason="LLM_MODEL nao definido - nada para medir"), 503
-    prompt = req.args.get("prompt", BENCH_PROMPT)
+    body = req.get_json(silent=True) or {}
+
+    def arg(name, default=None):
+        # query vence; ausente em ambos -> default
+        if name in req.args:
+            return req.args.get(name)
+        return body.get(name, default)
+
+    prompt = str(arg("prompt", BENCH_PROMPT))
     try:
-        runs = int(req.args.get("runs", BENCH_RUNS))
-    except ValueError:
+        runs = int(arg("runs", BENCH_RUNS))
+    except (TypeError, ValueError):
         runs = BENCH_RUNS
     runs = max(1, min(runs, 20))  # teto duro p/ nao estourar o worker
-    think = _parse_think(req.args.get("think"))
+    think = _parse_think(arg("think"))
     options = {}
-    if req.args.get("num_ctx"):
+    num_ctx = arg("num_ctx")
+    if num_ctx:
         try:
-            options["num_ctx"] = int(req.args["num_ctx"])
-        except ValueError:
+            options["num_ctx"] = int(num_ctx)
+        except (TypeError, ValueError):
             pass
-    keep_alive_raw = req.args.get("keep_alive")
+    keep_alive_raw = arg("keep_alive")
     keep_alive = _normalize_keep_alive(keep_alive_raw)
     t_start = time.time()
     resumo = _bench_runs(prompt, think=think, runs=runs,
@@ -1451,7 +1495,7 @@ def bench():
     return jsonify(resumo)
 
 
-@app.get("/sweep")
+@app.route("/sweep", methods=["GET", "POST"])
 def sweep():
     """Varredura de parametros: testa combinacoes de num_ctx x keep_alive e
     reporta as metricas de cada ponto. Serve para escolher configuracao.
@@ -1463,15 +1507,26 @@ def sweep():
       keep_alive_list: 30s,-1
       think          : off (esquenta sem raciocinio longo)
       prompt         : BENCH_PROMPT
-    Uso: /sweep?num_ctx_list=2048,8192&keep_alive_list=0,-1"""
+    Uso: /sweep?num_ctx_list=2048,8192&keep_alive_list=0,-1
+
+    POST com JSON aceita os mesmos campos no corpo (mesmo motivo do /bench:
+    prompts longos estouram o limite de ~4 KB da request line no gateway)."""
     if not LLM_MODEL:
         return jsonify(ok=False,
                        reason="LLM_MODEL nao definido - nada para medir"), 503
-    ctx_vals = _parse_int_list(req.args.get("num_ctx_list"),
+    body = req.get_json(silent=True) or {}
+
+    def arg(name, default=None):
+        # query vence; ausente em ambos -> default
+        if name in req.args:
+            return req.args.get(name)
+        return body.get(name, default)
+
+    ctx_vals = _parse_int_list(arg("num_ctx_list"),
                                default=[2048, 4096, 8192])
-    ka_vals = _split_csv(req.args.get("keep_alive_list"), default=["30s", "-1"])
-    think = _parse_think(req.args.get("think")) or False
-    prompt = req.args.get("prompt", BENCH_PROMPT)
+    ka_vals = _split_csv(arg("keep_alive_list"), default=["30s", "-1"])
+    think = _parse_think(arg("think")) or False
+    prompt = str(arg("prompt", BENCH_PROMPT))
     pontos = []
     for ctx in ctx_vals:
         for ka in ka_vals:
@@ -1528,7 +1583,7 @@ def perf_page():
     modelo na memoria (/api/ps via /llm/version) e throughput sob demanda
     (/bench). O formulario roda /bench via fetch e pinta a tabela no navegador."""
     model = LLM_MODEL or "(LLM_MODEL nao definido)"
-    return render_template("perf.html", model=model, url=LLM_URL)
+    return render_template("perf.html", model=model, url=_endpoint_mask())
 
 
 @app.get("/env")

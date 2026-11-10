@@ -215,11 +215,16 @@ k = app.step_env()["vars"]["LLM_API_KEY"]
 check("env: LLM_API_KEY presence-only",
       k["present"] is False and "value" not in k, str(k))
 
-# Porta da LLM mora em LLM_PORT; step_tcp usa target HOST:LLM_PORT.
+# Porta da LLM mora em LLM_PORT; step_tcp NAO expoe o hostname (repo publico).
 check("app: LLM_PORT existe, sem global PORT",
       hasattr(app, "LLM_PORT") and not hasattr(app, "PORT"), "")
-check("tcp: target HOST:LLM_PORT",
-      app.step_tcp()["target"] == f"{app.HOST}:{app.LLM_PORT}", "")
+check("tcp: target mascarado ***:LLM_PORT",
+      app.step_tcp()["target"] == f"***:{app.LLM_PORT}", "")
+check("tcp: target nao contem hostname interno",
+      app.HOST not in app.step_tcp()["target"], "")
+check("mask: endpoint mostra porta mas nao o hostname",
+      app.HOST not in app._endpoint_mask() and str(app.LLM_PORT) in app._endpoint_mask(),
+      app._endpoint_mask())
 
 # Deadline thread-local, isolado entre threads (sem race probe/api_ask).
 check("deadline: ctx thread-local, sem global",
@@ -331,6 +336,40 @@ check("/bench: keep_alive bruto ecoado", jb["_meta"]["keep_alive"] == "-1", "")
 check("/bench: keep_alive enviado normalizado (-1 numero)",
       jb["_meta"]["keep_alive_sent"] == -1, str(jb["_meta"].get("keep_alive_sent")))
 check("/bench: agregado presente", jb["eval_tps"]["p50"] == 50.0, str(jb["eval_tps"]))
+
+# POST com JSON: mesmo contrato da query, e permite prompt longo (a request line
+# do gateway limita GET a ~4 KB; o corpo nao tem esse teto).
+rpb = client.post("/bench", json={"runs": 1, "num_ctx": 2048,
+                                  "think": "off", "keep_alive": "-1",
+                                  "prompt": "palavra " * 2000})
+jpb = rpb.get_json()
+check("/bench POST: HTTP 200", rpb.status_code == 200, str(rpb.status_code))
+check("/bench POST: prompt longo aceito (16k chars via corpo)",
+      jpb["_meta"]["prompt_chars"] == 16000,
+      str(jpb["_meta"].get("prompt_chars")))
+check("/bench POST: num_ctx do corpo aplicado",
+      jpb["_meta"]["options"] == {"num_ctx": 2048}, str(jpb.get("_meta")))
+check("/bench POST: think off do corpo aplicado",
+      jpb["_meta"]["think_sent"] is False, str(jpb["_meta"].get("think_sent")))
+check("/bench POST: keep_alive -1 normalizado do corpo",
+      jpb["_meta"]["keep_alive_sent"] == -1, str(jpb["_meta"].get("keep_alive_sent")))
+# Query vence o corpo quando ambos presentes (retrocompatibilidade).
+rmix = client.post("/bench?runs=1&num_ctx=512", json={"num_ctx": 8192})
+check("/bench POST: query vence o corpo",
+      rmix.get_json()["_meta"]["options"] == {"num_ctx": 512},
+      str(rmix.get_json().get("_meta")))
+
+# POST /sweep: mesmos campos no corpo (prompt longo tambem passa pelo gateway).
+rsp = client.post("/sweep", json={"num_ctx_list": [2048], "keep_alive_list": ["-1"],
+                                  "think": "off", "prompt": "palavra " * 2000})
+# (listas reais no corpo: foi assim que o debug pegou o bug de str(list))
+jspp = rsp.get_json()
+check("/sweep POST: HTTP 200", rsp.status_code == 200, str(rsp.status_code))
+check("/sweep POST: lista do corpo aplicada",
+      jspp["points_run"] == 1 and jspp["results"][0]["num_ctx"] == 2048,
+      str(jspp.get("results"))[:160])
+check("/sweep POST: keep_alive -1 normalizado",
+      jspp["results"][0]["keep_alive_sent"] == -1, str(jspp["results"][0]))
 
 # Sem LLM_MODEL -> 503 honesto.
 _m = app.LLM_MODEL

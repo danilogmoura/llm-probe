@@ -155,20 +155,34 @@ vêm do próprio servidor: no último chunk do streaming (`"done": true`), o Oll
 **nanossegundos**) e `eval_count`/`prompt_eval_count` (tokens). O probe converte para ms e
 calcula throughput — nada é estimado no cliente, exceto o TTFT.
 
-- `GET /bench` → **benchmark sequencial**: repete a mesma geração `runs` vezes e agrega
-  **p50/p95/min/max** das métricas-chave. Parâmetros de query:
+- `GET|POST /bench` → **benchmark sequencial**: repete a mesma geração `runs` vezes e
+  agrega **p50/p95/min/max** das métricas-chave. Parâmetros (query ou corpo JSON):
   - `prompt` (default `BENCH_PROMPT`), `runs` (default `BENCH_RUNS`, teto duro 20),
     `think=on|off`, `num_ctx=<int>` (vai em `options.num_ctx`), `keep_alive=<s|-1|0>`.
   - Retorna `ttft_ms` (tempo até o primeiro token, medido no cliente), `eval_tps`
     (tokens/s de saída, do servidor), `load_ms` (custo de carregar o modelo — alto indica
     `keep_alive` curto / cold start), `total_ms`, além de `per_run` com os runs brutos.
   - Ex.: `GET /bench?runs=3&num_ctx=4096&keep_alive=-1&think=off`
-- `GET /sweep` → **varredura de parâmetros**: testa o produto `num_ctx_list × keep_alive_list`
+- `GET|POST /sweep` → **varredura de parâmetros**: testa o produto `num_ctx_list × keep_alive_list`
   (1 geração por ponto) e reporta as métricas de cada combinação, para escolher configuração.
   Limitado por `SWEEP_MAX_POINTS` para caber no `--timeout`. Parâmetros:
   `num_ctx_list` (default `2048,4096,8192`), `keep_alive_list` (default `30s,-1`),
   `think` (default `off`), `prompt`.
   - Ex.: `GET /sweep?num_ctx_list=2048,8192&keep_alive_list=0,-1`
+
+> **Prompt longo use `POST` com corpo JSON.** O App Service limita a *request line*
+> a ~4 KB e devolve `400 Request Line is too large` antes de chegar ao Flask — um
+> prompt de teste de contexto via query estoura esse teto. Os mesmos campos vão no
+> corpo (a query ainda tem prioridade quando presente):
+>
+> ```bash
+> curl -X POST "$BASE/bench" -H 'Content-Type: application/json' \
+>   -d '{"prompt":"<24 mil chars>","runs":1,"num_ctx":2048,"think":"off"}'
+> ```
+>
+> No Postman: método `POST`, aba **Body → raw → JSON**. Em `num_ctx_list` /
+> `keep_alive_list` do `/sweep` envie lista JSON (`[2048,8192]`) ou string CSV
+> (`"2048,8192"`) — as duas formas funcionam.
 
 > **Custo:** `/bench` e `/sweep` rodam **gerações reais em série** — podem levar minutos.
 > Assim como `/llm/default-think` e `/llm/openai-compat`, ficam **fora** da cascata `/probe`;
