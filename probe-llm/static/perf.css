@@ -1,0 +1,259 @@
+/* probe-llm - tema "btop-like": dark, monospace, barras segmentadas.
+   Zero dependencias externas (sem CDN/fonte). Reaproveitado por /perf, /chat e /. */
+
+:root {
+    --bg: #0c0c14;
+    --panel: #12121d;
+    --line: #23233a;
+    --fg: #c8c8d8;
+    --dim: #6a6a85;
+    --cyan: #4bd4e0;
+    --green: #7ee08a;
+    --yellow: #e6d06a;
+    --red: #f07178;
+    --blue: #6aa9e0;
+    --purple: #b888e0;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: ui-monospace, "Cascadia Mono", "JetBrains Mono", Consolas, Menlo, monospace;
+    font-size: 13px;
+    line-height: 1.45;
+    max-width: 900px;
+    margin: 1.2rem auto;
+    padding: 0 1rem;
+}
+
+h1 {
+    font-size: 1.05rem;
+    color: var(--cyan);
+    letter-spacing: .04em;
+    margin: 0 0 .2rem;
+}
+
+h2 {
+    font-size: .82rem;
+    text-transform: uppercase;
+    letter-spacing: .12em;
+    color: var(--purple);
+    margin: 1.4rem 0 .5rem;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: .25rem;
+}
+
+a {
+    color: var(--blue);
+    text-decoration: none;
+}
+
+a:hover {
+    color: var(--cyan);
+    text-decoration: underline;
+}
+
+.sub,
+.dim,
+.muted {
+    color: var(--dim);
+    font-size: .82rem;
+}
+
+code {
+    background: var(--panel);
+    color: var(--yellow);
+    padding: .05rem .35rem;
+    border-radius: 3px;
+    font-size: .85em;
+}
+
+pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: .7rem;
+    margin: .5rem 0;
+    min-height: 2rem;
+    color: var(--fg);
+}
+
+/* Painel estilo btop: borda + cantos em U+250C etc via ::before opcional; simples aqui. */
+.panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: .7rem .8rem;
+    margin: .5rem 0;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: .7rem;
+}
+
+.kv {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: .12rem .8rem;
+    align-items: baseline;
+}
+
+.kv dt {
+    color: var(--dim);
+    font-weight: 400;
+}
+
+.kv dd {
+    margin: 0;
+    text-align: right;
+    color: var(--fg);
+}
+
+/* Barra segmentada tipo btop: <div class="bar"><span style="--pct:62%"></span></div> */
+.bar {
+    position: relative;
+    height: 1.05em;
+    line-height: 1.05em;
+    overflow: hidden;
+    border-radius: 3px;
+    background: transparent;
+    font-size: 13px;
+    white-space: nowrap;
+}
+
+.bar::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: repeating-linear-gradient(90deg, var(--seg, #2a2a3a) 0 1ch, transparent 1ch 1.15ch);
+    opacity: .35;
+}
+
+.bar>i {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: var(--pct, 0%);
+    background: repeating-linear-gradient(90deg, var(--c, var(--cyan)) 0 1ch, transparent 1ch 1.15ch);
+}
+
+.bar>b {
+    position: absolute;
+    right: .3rem;
+    top: 0;
+    font-weight: 400;
+    color: var(--fg);
+    font-size: .85em;
+}
+
+/* Sparkline: canvas pequeno com traco fino */
+.spark {
+    display: block;
+    width: 100%;
+    height: 46px;
+    image-rendering: pixelated;
+}
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: .85rem;
+}
+
+th,
+td {
+    text-align: left;
+    padding: .25rem .5rem;
+    border-bottom: 1px solid var(--line);
+}
+
+th {
+    color: var(--dim);
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    font-size: .72rem;
+}
+
+.row {
+    display: flex;
+    gap: .6rem;
+    align-items: center;
+    margin: .6rem 0;
+    flex-wrap: wrap;
+}
+
+input,
+select,
+textarea {
+    font: inherit;
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: .35rem .5rem;
+}
+
+textarea {
+    width: 100%;
+    min-height: 90px;
+}
+
+button {
+    font: inherit;
+    padding: .45rem .9rem;
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    background: #1a1a2a;
+    color: var(--cyan);
+    cursor: pointer;
+}
+
+button:hover {
+    border-color: var(--cyan);
+}
+
+button:disabled {
+    opacity: .45;
+    cursor: default;
+}
+
+button.ghost {
+    background: transparent;
+    color: var(--dim);
+}
+
+.ok {
+    color: var(--green)
+}
+
+.warn {
+    color: var(--yellow)
+}
+
+.err {
+    color: var(--red)
+}
+
+summary {
+    cursor: pointer;
+    color: var(--dim);
+    font-size: .82rem;
+}
+
+label {
+    display: inline-flex;
+    gap: .35rem;
+    align-items: center;
+    font-size: .82rem;
+    color: var(--dim);
+}

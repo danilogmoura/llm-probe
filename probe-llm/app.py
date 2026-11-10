@@ -27,7 +27,8 @@ import time
 from urllib.parse import urlparse
 
 import requests
-from flask import Flask, Response, jsonify, render_template, request as req
+from flask import (Flask, Response, jsonify, render_template,
+                   request as req, send_from_directory)
 
 APP_NAME = "probe-llm"
 
@@ -1249,17 +1250,26 @@ def step_ready():
 @app.get("/")
 def home():
     return (
-        "probe-llm | rotas de diagnostico:<br>"
-        "<b>estado:</b> /health /ready /env<br>"
-        "<b>LLM:</b> /probe (cascata dns-tcp-tls-model) "
-        "/llm/generate-stream?prompt=... (SSE p/ thinking)<br>"
-        "<b>OpenAI-compat:</b> /llm/openai-compat (testa /v1/models e "
-        "/v1/chat/completions)<br>"
-        "<b>Versao:</b> /llm/version (identifica a versao do Ollama)<br>"
-        "<b>Performance:</b> /bench?runs=3&num_ctx=4096&keep_alive=-1 "
-        "(TTFT/tokens-s/p50-p95) &middot; /sweep?num_ctx_list=2048,8192 "
-        "&amp;keep_alive_list=0,-1 (varre parametros)<br>"
-        '<a href="/chat">Ir para a pagina de perguntas (chat)</a>'
+        "<!doctype html><html lang='pt-br'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>probe-llm</title>"
+        "<link rel='stylesheet' href='/static/perf.css'></head><body>"
+        "<h1>&#9635; probe-llm</h1>"
+        "<div class='sub'>diagnóstico do LLM institucional &middot; "
+        f"LLM_URL <code>{LLM_URL or '(nao definido)'}</code> &middot; modelo "
+        f"{LLM_MODEL or '(nao definido)'} "
+        "&middot; <a href='/perf'>monitor</a> &middot; <a href='/chat'>chat</a></div>"
+        "<dl class='kv'>"
+        "<dt>estado</dt><dd>/health &middot; /ready &middot; /env</dd>"
+        "<dt>LLM</dt><dd>/probe (cascata dns-tcp-tls-model) &middot; "
+        "/llm/generate-stream (SSE p/ thinking)</dd>"
+        "<dt>OpenAI-compat</dt><dd>/llm/openai-compat (/v1/models, /v1/chat/completions)</dd>"
+        "<dt>Versão</dt><dd>/llm/version (identifica o Ollama)</dd>"
+        "<dt>Performance</dt><dd>/bench &middot; /sweep &middot; <a href='/perf'>/perf</a></dd>"
+        "<dt>Recursos</dt><dd>/system/stats &middot; <a href='/perf'>painel</a></dd>"
+        "</dl>"
+        "<p class='muted'>Credenciais nunca aparecem em nenhuma rota.</p>"
+        "</body></html>"
     )
 
 
@@ -1467,6 +1477,14 @@ def sweep():
                  "os pontos; keep_alive=0 descarrega apos cada chamada, -1 fixa."),
     })
 
+
+@app.get("/static/perf.css")
+def static_perf_css():
+    """CSS compartilhado do tema btop-like (perf + chat + home). Servido pelo
+    proprio app para nao depender da pasta static/ no empacotamento."""
+    return send_from_directory(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "static"),
+        "perf.css", mimetype="text/css")
 
 
 @app.get("/system/stats")
