@@ -40,6 +40,12 @@ LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "120"))
 # valor passado em --timeout no Dockerfile. Se mudar la, mude aqui.
 GUNICORN_TIMEOUT = float(os.environ.get("GUNICORN_TIMEOUT", "180"))
 
+# Timeout de CONECTIVIDADE (TCP/TLS ate abrir a conexao). Um host morto ou porta
+# fechada deveria falhar rapido em TODAS as rotas, nao esperar LLM_TIMEOUT inteiro
+# por um SYN que nunca vem. Valores de leitura (resposta da LLM) seguem LLM_TIMEOUT.
+# Mantido consistente com o streaming, que ja usava 10s de connect.
+CONNECT_TIMEOUT = float(os.environ.get("CONNECT_TIMEOUT", "10"))
+
 # Orcamento de tempo do /probe (segundos). O gunicorn mata o worker quando uma
 # requisicao ultrapassa --timeout (GUNICORN_TIMEOUT). Como cada chamada LLM pode
 # levar ate LLM_TIMEOUT, o /probe roda em cascata apenas ate este budget e
@@ -69,12 +75,22 @@ _PROBE_DEADLINE = None
 
 
 def _net_timeout(default=None):
-    """Timeout de rede respeitando o budget do /probe, quando ativo."""
+    """Devolve a dupla (connect, read) de timeout de rede p/ requests.
+
+    connect fica fixo em CONNECT_TIMEOUT (falha rapido se o host nao responde);
+    read segue LLM_TIMEOUT, encurtado ao restante do budget quando o /probe esta
+    em cascata. Rotas de socket puro (tcp/tls) usam _read_timeout() direto."""
     base = default if default is not None else LLM_TIMEOUT
-    if _PROBE_DEADLINE is None:
-        return base
-    left = _PROBE_DEADLINE[0] - time.time()
-    return max(0.5, min(base, left))
+    read = base
+    if _PROBE_DEADLINE is not None:
+        left = _PROBE_DEADLINE[0] - time.time()
+        read = max(0.5, min(base, left))
+    return (CONNECT_TIMEOUT, read)
+
+
+def _read_timeout(default=None):
+    """Escalar-only: valor unico p/ socket.create_connection (que aceita float)."""
+    return _net_timeout(default)[1]
 
 
 def step_dns():
@@ -90,7 +106,7 @@ def step_dns():
 def step_tcp():
     t0 = time.time()
     try:
-        with socket.create_connection((HOST, PORT), timeout=_net_timeout()):
+        with socket.create_connection((HOST, PORT), timeout=_read_timeout()):
             return {"ok": True, "target": f"{HOST}:{PORT}",
                     "ms": round((time.time() - t0) * 1000)}
     except OSError as exc:
@@ -101,7 +117,7 @@ def step_tcp():
 def step_tls():
     t0 = time.time()
     try:
-        raw = socket.create_connection((HOST, PORT), timeout=_net_timeout())
+        raw = socket.create_connection((HOST, PORT), timeout=_read_timeout())
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -211,7 +227,7 @@ def step_generate_stream(prompt, think=None):
     t0 = time.time()
     try:
         with requests.post(url, json=payload, stream=True,
-                           timeout=(10, LLM_TIMEOUT), verify=False) as resp:
+                           timeout=_net_timeout(), verify=False) as resp:
             if not resp.ok:
                 yield _sse({"event": "error", "status": resp.status_code,
                             "error_body": resp.text[:300]})
@@ -260,8 +276,8 @@ def step_env():
             info["port"] = parsed.port
         return info
 
-    keys = ["LLM_URL", "LLM_MODEL", "LLM_TIMEOUT", "PROBE_BUDGET",
-            "CHAT_BUDGET", "PORT", "PROBE_PROMPT"]
+    keys = ["LLM_URL", "LLM_MODEL", "LLM_TIMEOUT", "CONNECT_TIMEOUT",
+            "PROBE_BUDGET", "CHAT_BUDGET", "PORT", "PROBE_PROMPT"]
     return {
         "ok": True,
         "app": APP_NAME,
@@ -269,6 +285,7 @@ def step_env():
         "llm_url_port": PORT,
         "llm_model_set": bool(LLM_MODEL),
         "llm_timeout_s": LLM_TIMEOUT,
+        "connect_timeout_s": CONNECT_TIMEOUT,
         "probe_budget_s": PROBE_BUDGET,
         "chat_budget_s": CHAT_BUDGET,
         "gunicorn_timeout_s": GUNICORN_TIMEOUT,
