@@ -324,8 +324,8 @@ def step_ready():
 def home():
     return (
         "probe-llm | rotas de diagnostico:<br>"
-        "<b>rede:</b> /health /env /ready /dns /tcp /tls<br>"
-        "<b>LLM:</b> /probe /llm/show /llm/generate?prompt=...&amp;think=on|off "
+        "<b>estado:</b> /health /ready /env<br>"
+        "<b>LLM:</b> /probe (cascata dns-tcp-tls-model) "
         "/llm/generate-stream?prompt=... (SSE p/ thinking)<br>"
         '<a href="/chat">Ir para a pagina de perguntas (chat)</a>'
     )
@@ -412,8 +412,7 @@ def probe_all():
                 "ok": None,
                 "deferred": True,
                 "reason": "modelo thinking pode exceder o budget do /probe; "
-                          "use GET /llm/generate-stream?prompt=... (SSE) ou "
-                          "GET /llm/generate?prompt=... para uma chamada unica",
+                          "para gerar, use GET /llm/generate-stream?prompt=... (SSE)",
             }
         out["_budget"] = {
             "budget_s": PROBE_BUDGET,
@@ -423,34 +422,6 @@ def probe_all():
     finally:
         _PROBE_DEADLINE = None
     return jsonify(out)
-
-
-@app.get("/dns")
-def probe_dns():
-    return jsonify(step_dns())
-
-
-@app.get("/tcp")
-def probe_tcp():
-    return jsonify(step_tcp())
-
-
-@app.get("/tls")
-def probe_tls():
-    return jsonify(step_tls())
-
-
-@app.get("/llm/show")
-def probe_show():
-    return jsonify(step_model())
-
-
-@app.get("/llm/generate")
-def probe_generate():
-    prompt = os.environ.get("PROBE_PROMPT", "Qual e 2+2? Responda so o numero.")
-    prompt = req.args.get("prompt", prompt)
-    think = _parse_think(req.args.get("think"))
-    return jsonify(step_generate(prompt, think=think))
 
 
 @app.get("/llm/generate-stream")

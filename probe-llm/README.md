@@ -7,8 +7,8 @@ ambiente e acesso à LLM etapa por etapa.
 A chamada de geração usa `POST {LLM_URL}/api/generate`. Como o modelo institucional é
 de **raciocínio longo (thinking)**, a forma confiável de obter uma resposta completa é a
 rota de **streaming** `GET /llm/generate-stream` (SSE): os tokens chegam conforme o modelo
-gera, mantendo a conexão viva e evitando `WORKER TIMEOUT`. Chamadas síncronas
-(`/llm/generate`, `/api/ask`) podem estourar o timeout em prompts que exigem muito raciocínio.
+gera, mantendo a conexão viva e evitando `WORKER TIMEOUT`. A chamada síncrona
+`/api/ask` (usada pelo chat) pode estourar o timeout em prompts que exigem muito raciocínio.
 
 O certificado é autogerado, então a verificação SSL é desabilitada (`verify=False`).
 
@@ -47,7 +47,7 @@ PROBE_BUDGET=55
 | `PROBE_BUDGET` | `55` | Teto (s) da cascata completa do `/probe`. |
 | `CHAT_BUDGET` | `150` | Teto (s) de cada pergunta na página `/chat` (rota `/api/ask`). |
 | `PORT` | `8080` | Porta de escuta (usada no fallback `python app.py`; o gunicorn fixa 8080). |
-| `PROBE_PROMPT` | `Qual e 2+2? Responda so o numero.` | Pergunta padrão usada por `/llm/generate` quando `?prompt=` é omitido. |
+| `PROBE_PROMPT` | `Qual e 2+2? Responda so o numero.` | Pergunta padrão usada por `/llm/generate-stream` quando `?prompt=` é omitido. |
 
 - `LLM_URL` e `LLM_MODEL` **não têm default no código** de propósito: o endereço real é
   do ambiente institucional e **não deve ser versionado no repositório público**. Consulte
@@ -66,9 +66,9 @@ PROBE_BUDGET=55
 
 ## Rotas
 
-O app expõe **13 rotas**: as de uso normal (chat + streaming) e as de diagnóstico em
-cascata (DNS → TCP → TLS → HTTP → LLM), que existem para testar a conectividade com a
-LLM interna etapa por etapa, sem nunca derrubar o servidor.
+O app expõe **8 rotas**: as de uso normal (chat + streaming) e as de diagnóstico.
+A conectividade com a LLM interna é testada pela cascata `/probe` (DNS → TCP → TLS →
+modelo), que roda todas as etapas em ordem num único JSON, sem nunca derrubar o servidor.
 
 ### Uso normal
 
@@ -87,23 +87,13 @@ LLM interna etapa por etapa, sem nunca derrubar o servidor.
 > interno `POST /api/show` com `{"model": <LLM_MODEL>}` (dados de um único modelo). O
 > `/api/tags`, que enumeraria todos os modelos, **não é chamado** em nenhuma rota.
 
-### Diagnóstico (uma rota por etapa)
+### Diagnóstico
 
 - `GET /health` → status simples (porta interna, `LLM_URL` e se `LLM_MODEL` está definido)
 - `GET /ready` → health de **prontidão**: faz um `POST /api/show` barato no `LLM_MODEL`
   e devolve `200` só quando o **modelo configurado** está de pé; enquanto não estiver,
   devolve **`503`** com um hint (atende o aviso do manual de que a LLM leva 1–2 min após
   iniciar). Bom para polling. Checa **só o seu modelo** — não lista os demais.
-- `GET /dns` → resolve o hostname do `LLM_URL`
-- `GET /tcp` → abre conexão TCP na porta do endpoint
-- `GET /tls` → handshake TLS com `verify=False` (cert autogerado, regra do manual)
-- `GET /llm/show` → acessa `POST {LLM_URL}/api/show` com `{"model": <LLM_MODEL>}` e
-  confirma que o **modelo configurado** existe e responde. Não enumera os outros modelos —
-  só status, URL, método, qual modelo foi checado (`checked_model`) e latência. Em falha,
-  inclui `error_body` para diferenciar "modelo não encontrado" de indisponibilidade.
-- `GET /llm/generate` → `POST {LLM_URL}/api/generate` com um prompt de teste (síncrono).
-  Aceita `?prompt=` e `?think=true|false`; sem `prompt` usa `PROBE_PROMPT`. Pode estourar
-  timeout em modelos thinking — prefira a rota de streaming abaixo.
 - `GET /llm/generate-stream` → **streaming SSE** (`text/event-stream`) sobre
   `POST {LLM_URL}/api/generate` com `stream:true`. Aceita `?prompt=` e `?think=on|off`.
   Emite eventos `data: {"event":"token","response":"..."}` (e `thinking` quando ligado)
