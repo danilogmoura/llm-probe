@@ -295,6 +295,16 @@ check("intlist: descarta invalidos",
 check("intlist: default se nada valida",
       app._parse_int_list("abc", [1, 2]) == [1, 2], "")
 
+# keep_alive: '-1' cru causa 400 no Ollama (ParseDuration sem unidade); o probe
+# deve normalizar antes de enviar.
+check("ka: None -> None", app._normalize_keep_alive(None) is None, "")
+check("ka: vazio -> None", app._normalize_keep_alive("  ") is None, "")
+check("ka: '-1' -> -1 (numero)", app._normalize_keep_alive("-1") == -1, "")
+check("ka: '0' -> '0s'", app._normalize_keep_alive("0") == "0s", "")
+check("ka: '30' -> '30s'", app._normalize_keep_alive("30") == "30s", "")
+check("ka: '30s' mantido", app._normalize_keep_alive("30s") == "30s", "")
+check("ka: '1h' mantido", app._normalize_keep_alive("1h") == "1h", "")
+
 # _bench_generate contra o fake NDJSON: TTFT presente, texto acumulado, metricas.
 app.LLM_URL = "http://127.0.0.1:8777"
 bg = app._bench_generate("oi", think=False)
@@ -317,7 +327,9 @@ jb = rb.get_json()
 check("/bench: HTTP 200", rb.status_code == 200, str(rb.status_code))
 check("/bench: meta com num_ctx", jb["_meta"]["options"] == {"num_ctx": 4096},
       str(jb.get("_meta")))
-check("/bench: keep_alive repassado", jb["_meta"]["keep_alive"] == "-1", "")
+check("/bench: keep_alive bruto ecoado", jb["_meta"]["keep_alive"] == "-1", "")
+check("/bench: keep_alive enviado normalizado (-1 numero)",
+      jb["_meta"]["keep_alive_sent"] == -1, str(jb["_meta"].get("keep_alive_sent")))
 check("/bench: agregado presente", jb["eval_tps"]["p50"] == 50.0, str(jb["eval_tps"]))
 
 # Sem LLM_MODEL -> 503 honesto.

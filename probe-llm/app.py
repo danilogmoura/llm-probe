@@ -471,6 +471,29 @@ def _percentile(vals, pct):
     return round(nums[lo] + (nums[hi] - nums[lo]) * frac, 2)
 
 
+def _normalize_keep_alive(raw):
+    """Normaliza 'keep_alive' para o payload do Ollama.
+
+    A API nativa parseia como Go time.ParseDuration, que exige unidade: a string
+    '-1' retorna 400 ('missing unit in duration'). Regras:
+      - None -> None (nao enviar o campo)
+      - inteiro negativo (-1) -> numero -1 (forever; JSON number nao passa por
+        ParseDuration)
+      - inteiro >= 0 em string ('0', '30') -> '<n>s' (unidade obrigatoria)
+      - string com unidade ('30s', '1h', '-1ns') -> mantem cru
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    try:
+        n = int(s)
+    except ValueError:
+        return s  # ja tem unidade (ex.: '30s') ou texto livre: passa cru
+    return n if n < 0 else f"{n}s"
+
+
 def _split_csv(raw, default=None):
     """Divide 'a,b,c' em lista de strings limpas; usa default se vazio/None."""
     if not raw:
@@ -1410,14 +1433,16 @@ def bench():
             options["num_ctx"] = int(req.args["num_ctx"])
         except ValueError:
             pass
-    keep_alive = req.args.get("keep_alive")
+    keep_alive_raw = req.args.get("keep_alive")
+    keep_alive = _normalize_keep_alive(keep_alive_raw)
     t_start = time.time()
     resumo = _bench_runs(prompt, think=think, runs=runs,
                          options=options or None, keep_alive=keep_alive)
     resumo["_meta"] = {
         "model": LLM_MODEL, "prompt_chars": len(prompt),
         "think_sent": think, "options": options or None,
-        "keep_alive": keep_alive,
+        "keep_alive": keep_alive_raw,
+        "keep_alive_sent": keep_alive,
         "elapsed_ms": round((time.time() - t_start) * 1000),
         "note": ("metricas vem do chunk final do Ollama (servidor); TTFT medido "
                  "no cliente. eval_tps = tokens de saida/s. load_ms alto = modelo "
@@ -1452,7 +1477,8 @@ def sweep():
         for ka in ka_vals:
             if len(pontos) >= SWEEP_MAX_POINTS:
                 break
-            pontos.append({"num_ctx": ctx, "keep_alive": ka})
+            pontos.append({"num_ctx": ctx, "keep_alive": ka,
+                           "keep_alive_sent": _normalize_keep_alive(ka)})
         else:
             continue
         break
@@ -1461,9 +1487,10 @@ def sweep():
     for p in pontos:
         r = _bench_generate(prompt, think=think,
                             options={"num_ctx": p["num_ctx"]},
-                            keep_alive=p["keep_alive"])
+                            keep_alive=p["keep_alive_sent"])
         resultados.append({
             "num_ctx": p["num_ctx"], "keep_alive": p["keep_alive"],
+            "keep_alive_sent": p["keep_alive_sent"],
             "ok": r.get("ok"), "ttft_ms": r.get("ttft_ms"),
             "total_ms": r.get("total_ms"), "load_ms": r.get("load_ms"),
             "eval_tps": r.get("eval_tps"), "eval_count": r.get("eval_count"),
