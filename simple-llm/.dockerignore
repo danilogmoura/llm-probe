@@ -1,0 +1,33 @@
+# Keep the Docker build context small and deterministic.
+# The image only needs requirements.txt and app.py (see Dockerfile).
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+
+# Local env / secrets — never bake these into the image
+.env
+.env.*
+*.key
+*.pem
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Docs & local helpers not used at runtime
+README.md
+postman/
+
+# Previous build artifacts
+*.tar
