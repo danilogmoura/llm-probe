@@ -67,7 +67,57 @@ Consolida o que foi **verificado empiricamente** nos testes do `probe-llm`
 9. Sempre enviar `think` explícito (default do servidor é ON e custa ~6 s).
 10. Budget de request abaixo do timeout do worker (`CHAT_BUDGET` < `gunicorn --timeout`).
 
+## 6. Medições quantitativas da LLM institucional (nov/2026)
+
+Números coletados ao vivo contra o servidor interno via `probe-llm`. Servem de
+orçamento para dimensionar qualquer app (timeouts, UX de streaming, custo de RAG).
+Modelo medido: `qwen3.5:9b-q4_K_M`; Ollama `0.40.13`; TLSv1.3.
+
+### 6.1 Throughput e latência (bench, `think=off`)
+
+| Estado | load_ms | TTFT | eval_tps |
+| --- | --- | --- | --- |
+| **Frio** (modelo recarregando na GPU) | ~3779 ms | ~3921 ms | **~35 tok/s** |
+| **Quente** (keep_alive ativo) | ~2 ms | ~148–174 ms | **~69 tok/s** |
+
+- **O gargalo é carga na GPU, não inferência**: ~96% do TTFT frio vem de
+  `load_ms`. Com `keep_alive=-1` (nunca descarrega), o TTFT cai de ~3,9 s para
+  ~0,15 s e o throughput dobra (~35 → ~69 tok/s).
+- Consequência de projeto: manter o modelo aquecido (`keep_alive=-1`) é a maior
+  alavanca de latência disponível; sem isso cada usuário após idle paga o reload.
+
+### 6.2 Truncamento **silencioso** de contexto (armadilha crítica p/ RAG)
+
+Ao enviar prompt maior que `num_ctx`, o servidor **não erro nem avisa** — responde
+HTTP 200 com saída normal, mas processa só uma janela do prompt:
+
+| Campo | Valor observado |
+| --- | --- |
+| `prompt_chars` enviado | 24 000 (~6 mil tokens) |
+| `num_ctx` pedido | 2048 |
+| `prompt_eval_count` real | **1026** (≈ metade dos tokens ignorada) |
+| `eval_count` (saída) | 54 · `ok`: true |
+
+- **Regra:** nunca confiar que "respondeu 200" significa "leu tudo". Sempre conferir
+  `prompt_eval_count` contra o nº esperado de tokens do chunk. Em RAG, se a soma dos
+  chunks passar de `num_ctx`, trechos são descartados **sem sinal de erro** — a
+  resposta fica plausível porém cega ao conteúdo cortado.
+
+### 6.3 Resiliência do worker sob geração longa (FASE 6)
+
+Sob uma geração demorada (`think=on`, `num_ctx=2048`, `runs=2`):
+
+- Os dois runs completaram: `eval_count` 1382 e 1562 tokens, `thinking_seen=true`,
+  `failed_runs=0`.
+- Enquanto a geração ocupava o **único worker gunicorn**, `GET /health` respondeu
+  **HTTP 000 (bloqueado)** por ~48 s e voltou a **200** assim que a carga terminou.
+- **Não houve crash nem queda do container** — apenas bloqueio temporário.
+- Confirma a restrição operacional: **um worker = uma geração por vez**. Nunca
+  disparar duas cargas pesadas em paralelo; projetar timeout/UX assumindo que
+  `/health` pode ficar indisponível durante uma geração longa.
+
 ---
 
-*Fonte: medições do `probe-llm` e `llm-bridge` em produção, nov/2026. Valores
-sensíveis do ambiente institucional permanecem fora deste repo.*
+*Fonte: medições do `probe-llm` e `llm-bridge` em produção, nov/2026 (seção 6 =
+coleta ao vivo FASE 3–6). Valores sensíveis do ambiente institucional permanecem
+fora deste repo.*
