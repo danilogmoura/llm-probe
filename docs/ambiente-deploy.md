@@ -14,8 +14,8 @@ Consolida o que foi **verificado empiricamente** nos testes do `probe-llm`
 | Upload é `.tar` pronto | O servidor **não compila** Dockerfile. Pipeline: `docker build` → `docker save --output app.tar <img>` → upload. |
 | Tamanho da imagem | Limite **≤ 1024 MB**. Exemplo real: imagem ~192 MB, tar ~45 MB (`python:3.12-slim` + Flask + gunicorn). |
 | Porta interna fixa, pública aleatória | Container escuta `0.0.0.0:8080`; a plataforma mapeia para uma porta pública **que muda a cada redeploy**. Nunca hardcode a porta pública. |
-| Autodescoberta de porta obrigatória | Como a porta roda, todo cliente precisa descobrir a porta atual. Padrão validado no `probe-llm/tests/smoke_api.sh`: memória da última porta boa → lista de candidatas → varredura automática do intervalo. |
-| HTTP 200 **não** identifica seu app | O **mesmo host publica outros apps** em outras portas (ex.: um Streamlit respondendo 200 em `/health`). A descoberta exige uma **assinatura própria** no `/health` (campos JSON únicos), senão escolhe a porta errada. |
+| Porta pública é **sempre informada**, nunca adivinhada | A porta externa **não se repete nem é previsível**, então nenhum cliente/teste deve tentar descobri-la por varredura. Quem acabou de fazer o deploy conhece a porta atual e a fornece explicitamente (no `probe-llm`, via `BASE=http://host:porta`). Rodar sem essa informação falha na hora — não tenta adivinhar. |
+| HTTP 200 **não** identifica seu app | O **mesmo host publica outros apps** em outras portas (ex.: um Streamlit respondendo 200 em `/health`). Por isso o `/health` mantém uma **assinatura própria** (campos JSON únicos): serve para **confirmar** que a porta informada é realmente do seu app, não para procurar portas. |
 | Acesso somente HTTP | A porta pública **não fala TLS**. Abrir com `https://` trava o navegador (handshake nunca completa). Sempre `http://host:porta`. |
 | Processo foreground | O container morre se o app for para background. gunicorn sem `--daemon`. |
 | Storage persistente só em `/persistent` | Qualquer outro caminho é efêmero entre restarts. |
@@ -58,11 +58,11 @@ Consolida o que foi **verificado empiricamente** nos testes do `probe-llm`
 
 1. Dockerfile: base slim, `EXPOSE 8080`, ouvir `0.0.0.0:8080`, foreground, imagem < 1 GB.
 2. Config **por variável de ambiente**, sem default sensível no código (endpoint/modelo).
-3. `/health` com **assinatura única** (JSON próprio) para autodescoberta de porta.
+3. `/health` com **assinatura única** (JSON próprio) para **confirmar** que a porta informada é do seu app.
 4. `/ready` com warmup tolerante (503 + Retry-After) para lidar com modelo frio; warmup em thread no boot.
 5. Env App Service: `WEBSITES_CONTAINER_START_TIME_LIMIT=300`, `WEBSITES_ENABLE_APP_SERVICE_STORAGE=false`.
 6. Cliente/ponte usa **HTTP** (não HTTPS) no host público; `verify=False` no interno.
-7. Descoberta de porta: última boa salva → candidatas → varredura automática.
+7. Porta pública **informada pelo operador do deploy** (nunca varrida/adivinhada); o teste exige `BASE` e falha imediatamente se faltar.
 8. Payloads grandes via POST; nada longo na query string.
 9. Sempre enviar `think` explícito (default do servidor é ON e custa ~6 s).
 10. Budget de request abaixo do timeout do worker (`CHAT_BUDGET` < `gunicorn --timeout`).

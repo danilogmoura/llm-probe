@@ -10,25 +10,22 @@
 #   FASE 5  Anti-vazamento    - nenhuma rota publica expoe o endpoint interno da LLM
 #   FASE 6  Timeout > budget  - geracao longa (think=on) nao derruba o worker
 #
-# Uso (BASE e OPCIONAL - o script descobre a porta sozinho):
-#   ./tests/smoke_api.sh                          # tudo, com autodescoberta
-#   ./tests/smoke_api.sh --skip-llm               # fases 1, 2 e 2b (sem geracoes caras)
-#   ./tests/smoke_api.sh --docker-only            # so a fase 1 (offline, sem rede)
+# Uso (BASE e OBRIGATORIO - a porta e SEMPRE informada por quem faz o deploy):
 #   BASE=http://SEU-HOST-PUBLICO:PORTA ./tests/smoke_api.sh
-#   HOST=<seu-host-publico> ./tests/smoke_api.sh   # host usado na autodescoberta
-#   IMAGE=meu-registro/probe-llm:tag ./tests/smoke_api.sh
+#   BASE=http://SEU-HOST-PUBLICO:PORTA ./tests/smoke_api.sh --skip-llm
+#   ./tests/smoke_api.sh --docker-only            # so a fase 1 (offline, sem rede)
+#   IMAGE=meu-registro/probe-llm:tag BASE=http://HOST:PORT ./tests/smoke_api.sh
 #
 # A FASE 4 roda GERACOES REAIS no LLM institucional: pode levar varios minutos e
 # consome VRAM/gpu-hora. Rode uma fase por vez se o servidor estiver instavel.
-# Variaveis: BASE, IMAGE, RUNS (default 2), NUM_CTX_SMALL (default 512).
+# Variaveis: BASE (obrigatorio fora --docker-only), IMAGE, RUNS (default 2),
+#           NUM_CTX_SMALL (default 512).
 #
-# ATENCAO - a porta publica MUDA a cada deploy do .tar no App Service: o Azure
-# realoca o container na VM e sorteia outra porta externa (o container continua
-# ouvindo 8080 internamente). Voce NUNCA precisa informar a porta:
-#   1. sem BASE, o script sonda PORT_CANDIDATES e usa o primeiro /health que
-#      responder 200 (atualize PORT_CANDIDATES apos um redeploy para acelerar);
-#   2. se nenhuma candidata funcionar, rode com --scan-all (varre 32768-32899);
-#   3. BASE="http://HOST:PORT" so e necessario como ultimo recurso manual.
+# POR QUE BASE E OBRIGATORIO: a porta publica MUDA a cada deploy do .tar no App
+# Service (o Azure realoca o container e sorteia outra porta externa; o container
+# segue ouvindo 8080 internamente). Essa porta NAO e previsivel nem reutilizavel,
+# entao o teste NUNCA tenta adivinha-la: quem acabou de fazer o deploy informa o
+# BASE correto. Rodar sem BASE (fora --docker-only) falha imediatamente pedindo-o.
 #
 # FLAKINESS CONHECIDA do ambiente (nao e bug do app):
 #   - O gunicorn roda com UM worker: uma geracao em andamento bloqueia os demais
@@ -41,22 +38,20 @@
 
 set -uo pipefail
 
-# Host publico do portal (sem credencial; cada usuario define o seu via env HOST).
-HOST_DEFAULT="${HOST:-}"
+# BASE (URL publica completa, host:porta) e OBRIGATORIO e SEMPRE informado por
+# quem fez o deploy: a porta externa do App Service muda a cada deploy e nao e
+# previsivel, portanto o teste jamais tenta adivinha-la ou varre faixas de porta.
 BASE="${BASE:-}"
 IMAGE="${IMAGE:-probe-llm:smoke}"
 RUNS="${RUNS:-2}"
 NUM_CTX_SMALL="${NUM_CTX_SMALL:-512}"
-PORT_CANDIDATES="${PORT_CANDIDATES:-32880 32878 32877 32879 32881 32882}"
 DOCKER_ONLY=0
 SKIP_LLM=0
-SCAN_ALL=0
 
 for a in "$@"; do
   case "$a" in
     --docker-only) DOCKER_ONLY=1 ;;
     --skip-llm)    SKIP_LLM=1 ;;
-    --scan-all)    SCAN_ALL=1 ;;
     -h|--help)     sed -n '2,40p' "$0"; exit 0 ;;
   esac
 done
@@ -152,75 +147,16 @@ summary() {
 }
 
 # ======================================================================
-# Descoberta da URL publica: a porta do App Service muda a cada deploy do .tar.
-# Estrategia em camadas, SEM depender do usuario informar a porta:
-#   1. BASE explicito (ultimo recurso manual);
-#   2. ultima porta usada com sucesso, salva em tests/.last_port;
-#   3. PORT_CANDIDATES padrao;
-#   4. fallback automatico: varredura completa 32768-32899 (--scan-all).
-# A confirmacao exige JSON do probe-llm em /health (nao apenas HTTP 200), pois
-# o mesmo host publica outros apps em outras portas.
-DISCOVER_TIMEOUT="${DISCOVER_TIMEOUT:-4}"
-# Em Bash nao-interativo, BASH_SOURCE pode estar vazio na fonte principal;
-# ${BASH_SOURCE[0]:-$0} cobre os dois casos (execucao direta e source).
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-LAST_PORT_FILE="$SCRIPT_DIR/.last_port"
-
-save_last_port() { printf '%s\n' "$1" > "$LAST_PORT_FILE" 2>/dev/null || true; }
-
-discover_ports() {
-  # $1 = lista de portas; ecoa a primeira cujo /health responde 200 COM JSON
-  # proprio do probe-llm. Status 200 sozinho NAO basta: o host Azure abriga
-  # outros apps (ex.: Streamlit em 32857) que tambem respondem 200 em /health.
-  local p body
-  for p in $1; do
-    body="$(curl -sS --max-time "$DISCOVER_TIMEOUT" \
-              "http://$HOST_DEFAULT:$p/health" 2>/dev/null | head -c 4096)"
-    if printf '%s' "$body" | grep -q '"status"' && printf '%s' "$body" | grep -q '"port"'; then
-      printf '%s' "$p"; return 0
-    fi
-    printf '  . porta %s -> sem JSON do probe-llm\n' "$p" >&2
-  done
-  return 1
-}
-
-discover_base() {
-  [ -n "$BASE" ] && return 0
-  if [ -z "$HOST_DEFAULT" ]; then
-    bad "HOST nao definido" \
-        "Defina o host publico do portal: HOST=<seu-host> $0  (ou BASE=http://<host>:<porta> $0)"
-    return 1
-  fi
-  local ports p saved
-  if [ "$SCAN_ALL" = 1 ]; then
-    ports="$(seq 32768 32899)"
-  else
-    ports="$PORT_CANDIDATES"
-    # porta descoberta na execucao anterior e a aposta mais provavel agora
-    saved="$(cat "$LAST_PORT_FILE" 2>/dev/null)"
-    if [ -n "$saved" ] && ! printf ' %s ' "$ports" | grep -q " $saved "; then
-      ports="$saved $ports"
-    fi
-  fi
-  say "PROCURANDO a porta publica em $HOST_DEFAULT (BASE nao definido)"
-  if p="$(discover_ports "$ports")"; then
-    BASE="http://$HOST_DEFAULT:$p"; ok "porta encontrada: $p"; save_last_port "$p"; return 0
-  fi
-  if [ "$SCAN_ALL" != 1 ]; then
-    say "candidatas esgotadas; VARREDURA AUTOMATICA 32768-32899 (fallback)"
-    if p="$(discover_ports "$(seq 32768 32899)")"; then
-      BASE="http://$HOST_DEFAULT:$p"; ok "porta encontrada no scan: $p"
-      save_last_port "$p"; return 0
-    fi
-  fi
-  bad "nenhuma porta respondeu 200 em /health (ate o scan completo falhou)" \
-      "Confira no portal Azure se o container esta rodando; depois informe: BASE=http://$HOST_DEFAULT:<porta> $0"
-  return 1
-}
-
+# Alvo: BASE e SEMPRE fornecido por quem fez o deploy. O teste NAO descobre,
+# nao guarda e nao varre portas - a porta externa do App Service muda a cada
+# deploy e nao e previsivel, entao adivinha-la seria sempre falso. Fora do modo
+# --docker-only (que sobe um container local na porta do proprio teste), a
+# ausencia de BASE interrompe imediatamente com instrucao clara.
 if [ "$DOCKER_ONLY" = 1 ]; then
-  skip "descoberta de porta (fase Docker nao usa rede institucional)"
-elif ! discover_base; then
+  : # fase Docker usa 127.0.0.1 com porta propria; nao precisa de BASE externo
+elif [ -z "$BASE" ]; then
+  bad "BASE nao definido" \
+      "Informe a URL publica do deploy: BASE=http://<host>:<porta> $0  (a porta muda a cada deploy e so quem fez o deploy sabe qual e)"
   summary; exit 1
 fi
 
