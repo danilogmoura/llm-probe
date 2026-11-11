@@ -320,6 +320,43 @@ else
     GET "/bench?runs=1&num_ctx=-5&think=off" || true
   WANT_TIMEOUT=200 http "GET /sweep?num_ctx_list=abc (default aplicado)" \
     GET "/sweep?num_ctx_list=abc&keep_alive_list=-1&think=off" || true
+
+  # --------------------------------------------------------------------
+  say "FASE 2c - Contratos de resposta (sem gerar tokens)"
+  # /api/ask usa get_json(silent=True) or {}: entrada ausente ou malformada NUNCA
+  # deve virar 500 nem derrubar o worker; cai no mesmo 400 do prompt vazio.
+  # Nenhuma dessas chamadas alcanca o modelo, entao sao baratas mesmo com worker unico.
+  WANT=400 http "POST /api/ask sem body -> 400 (nao 500)" POST /api/ask || true
+  if [ -n "${LAST_BODY:-}" ] && [ -f "${LAST_BODY:-}" ]; then
+    jbool "/api/ask sem body responde ok=false" "$LAST_BODY" 'd.get("ok") is False'
+  fi
+  WANT=400 EXPECT_JSON=1 http "POST /api/ask JSON malformado -> 400 (nao 500)" POST /api/ask \
+    -H 'Content-Type: application/json' -d '{"prompt":' || true
+  if [ -n "${LAST_BODY:-}" ] && [ -f "${LAST_BODY:-}" ]; then
+    jbool "/api/ask JSON malformado responde ok=false" "$LAST_BODY" 'd.get("ok") is False'
+  fi
+
+  # /probe nunca executa geracao: marca generate como deferred e devolve o budget.
+  # Asserta o contrato direto na cascata ja chamada em FASE 3 (barato, sem gerar).
+  WANT_TIMEOUT=120 http "GET /probe (contrato budget/deferred)" GET /probe || true
+  if [ -n "${LAST_BODY:-}" ] && [ -f "${LAST_BODY:-}" ]; then
+    jbool "probe gera de forma adiada (deferred)" "$LAST_BODY" 'd["generate"].get("deferred") is True'
+    jbool "probe declara orcamento de tempo"      "$LAST_BODY" '"_budget" in d and "remaining_ms" in d["_budget"]'
+  fi
+
+  # /ready emite Retry-After APENAS quando ainda nao esta pronto (cold start).
+  # Se o modelo ja estiver warm, o header nao aparece por design: isso e skip,
+  # nao FAIL (mesma licao da FASE 6 - nao punir premissa ambiental valida).
+  READY_HDR="$(curl -sS -D - -o /dev/null --max-time 30 "$BASE/ready" 2>/dev/null | tr -d '\r')"
+  if printf '%s' "$READY_HDR" | grep -qi '^HTTP/1.1 503'; then
+    if printf '%s' "$READY_HDR" | grep -qi '^Retry-After:'; then
+      ok "GET /ready (503) traz header Retry-After"
+    else
+      bad "GET /ready (503) sem Retry-After" "polling de cold start fica sem dica de espera"
+    fi
+  else
+    skip "GET /ready Retry-After (modelo ja aquecido; header so existe no estado 503)"
+  fi
 fi
 
 # ======================================================================
