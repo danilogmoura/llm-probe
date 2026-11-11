@@ -112,9 +112,18 @@ Sob uma geração demorada (`think=on`, `num_ctx=2048`, `runs=2`):
 - Enquanto a geração ocupava o **único worker gunicorn**, `GET /health` respondeu
   **HTTP 000 (bloqueado)** por ~48 s e voltou a **200** assim que a carga terminou.
 - **Não houve crash nem queda do container** — apenas bloqueio temporário.
-- Confirma a restrição operacional: **um worker = uma geração por vez**. Nunca
-  disparar duas cargas pesadas em paralelo; projetar timeout/UX assumindo que
-  `/health` pode ficar indisponível durante uma geração longa.
+- O bloqueio é **por run individual**, não pela chamada inteira: num `bench runs=N`,
+  o worker libera `GET /health` no **intervalo entre** um run e o próximo. Em uma
+  medição posterior (`runs=2`), sondas durante a carga pegaram `/health` respondendo
+  **200 em 1 das 3 tentativas** — justamente numa janela entre runs. Portanto "mudo
+  durante a geração" é esperado mas **intermitente**, não permanente.
+- Confirma a restrição operacional: **um worker = uma geração por vez (run a run)**.
+  Nunca disparar duas cargas pesadas em paralelo; projetar timeout/UX assumindo que
+  `/health` pode ficar indisponível durante cada geração, recuperando nos intervalos.
+- Consequência para o smoke test (FASE 6): exigir `/health` 200 *durante* a carga é
+  premissa de worker concorrente (`--workers >1`) e **não vale** para `--workers 1`.
+  A resiliência real é provada por (a) JSON válido ao fim da chamada longa e (b)
+  `/health` voltar 200 depois — nunca pelo silêncio momentâneo durante.
 
 ---
 
