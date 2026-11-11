@@ -66,7 +66,7 @@ curl -s -X POST http://localhost:8080/ask \
 
 ```
 simple-llm/
-├── app.py             # Flask: 2 rotas (GET / e POST /ask)
+├── app.py             # Flask: 3 rotas (GET /, POST /ask e GET /favicon.ico)
 ├── requirements.txt   # Flask, requests, urllib3
 ├── Dockerfile         # python:3.12-slim, expõe 8080, CMD python app.py
 └── README.md

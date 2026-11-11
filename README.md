@@ -2,15 +2,21 @@
 
 Repositório para imagens Docker enviadas ao portal **Devel LLM**.
 
-A única imagem mantida neste repo é:
+Este repo mantém **três aplicações**, cada uma na sua pasta com `app.py`,
+`Dockerfile`, `requirements.txt` e `README.md` próprios:
 
 ```text
-probe-llm/
+probe-llm/     # sonda de diagnóstico (Flask/Gunicorn): rede, ambiente do container,
+               #   cascata de conectividade, chat, bench/sweep e monitor de recursos.
+llm-bridge/    # proxy transparente da API OpenAI para a LLM interna (Ollama).
+simple-llm/    # exemplo mínimo: uma página com campo de pergunta + thinking on/off.
 ```
 
-Ela contém uma aplicação Flask/Gunicorn de diagnóstico para validar rede, storage, ambiente interno do container e acesso à LLM institucional.
+A imagem principal de entrega é o **`probe-llm/`**; as outras duas são utilitários de
+referência que compartilham as mesmas regras de plataforma (escuta em `0.0.0.0:8080`,
+processo em primeiro plano, sem VOLUME, SSL `verify=False`).
 
-## Build da imagem mantida
+## Build da imagem principal
 
 A imagem deve ter um **identificador unico, sem caracteres especiais** (ponto vira
 hifen). Substitua `<seu-identificador>` pelo seu:

@@ -76,7 +76,7 @@ PROBE_BUDGET=55
 
 ## Rotas
 
-O app expõe **16 rotas**: as de uso normal (chat + streaming), as de diagnóstico/aquecimento,
+O app expõe **17 rotas**: as de uso normal (chat + streaming), as de diagnóstico/aquecimento,
 as de performance (`/bench`, `/sweep`) e as de recursos do container (`/system/stats`, `/perf`).
 A conectividade com a LLM interna é testada pela cascata `/probe` (DNS → TCP → TLS →
 modelo → versão), que roda todas as etapas em ordem num único JSON, sem nunca derrubar o servidor.

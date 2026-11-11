@@ -5,7 +5,8 @@ Testa, por etapas e SEM derrubar o servidor:
   2. TCP   -> conecta na porta do endpoint
   3. TLS   -> handshake com verify=False (cert autogerado, regra do manual)
   4. MODEL -> POST /api/show {"model": LLM_MODEL} (checa so o modelo configurado)
-  5. LLM   -> POST /api/generate com LLM_MODEL
+  5. GENERATE -> NAO executado na cascata: sai como "deferred" (modelos thinking
+     podem levar minutos; para gerar use GET /llm/generate-stream via SSE).
   6. OPENAI-> GET /v1/models + POST /v1/chat/completions (sync e stream SSE),
      para confirmar se a camada OpenAI-compativel do Ollama esta exposta.
   7. VERSION-> GET /api/version (e /api/ps) para identificar a VERSAO exata do
